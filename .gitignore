@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+reports/
+*.egg-info/
+dist/
+build/
+data/trades.db
+data/trades.db-wal
+data/trades.db-shm
+data/ml_model.joblib
+data/optimizer_log.json
