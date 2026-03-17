@@ -41,8 +41,11 @@ def fetch_unusual_options_activity(symbol: str) -> list[dict]:
         if df is None or df.empty:
             continue
         for _, row in df.iterrows():
-            vol = int(row.get("volume", 0) or 0)
-            oi = int(row.get("openInterest", 0) or 0)
+            import math
+            _vol = row.get("volume", 0)
+            _oi = row.get("openInterest", 0)
+            vol = 0 if (_vol is None or (isinstance(_vol, float) and math.isnan(_vol))) else int(_vol)
+            oi = 0 if (_oi is None or (isinstance(_oi, float) and math.isnan(_oi))) else int(_oi)
             strike = float(row.get("strike", 0) or 0)
 
             if vol == 0:

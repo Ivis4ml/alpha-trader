@@ -132,7 +132,7 @@ class PaperTrader:
         Parameters
         ----------
         symbol : str
-            Underlying ticker, e.g. ``"AMZN"``.
+            Underlying ticker, e.g. ``"NVDA"``.
         expiry : str
             Expiration date ``"YYYY-MM-DD"``.
 
@@ -171,7 +171,7 @@ class PaperTrader:
     # ------------------------------------------------------------------
     @staticmethod
     def _build_osi_symbol(symbol: str, expiry: str, strike: float, right: str = "C") -> str:
-        """Build an OSI option symbol, e.g. ``AMZN260417C00225000``.
+        """Build an OSI option symbol, e.g. ``NVDA260417C00225000``.
 
         Parameters
         ----------

@@ -36,7 +36,7 @@ def send_telegram(text: str, parse_mode: str | None = "Markdown") -> bool:
     """Send a message via Telegram Bot API. Returns True on success."""
     token, chat_id = _get_creds()
     if not token or not chat_id:
-        print("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (see .env.example)")
+        print("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (see .env.template)")
         return False
 
     for chunk in _split(text):

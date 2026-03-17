@@ -379,15 +379,33 @@ You approve → config updates → next scan improves
 
 ## Data Sources
 
-All free. No API keys required for core functionality.
+Core functionality requires **zero API keys**. Optional keys unlock richer data.
 
-| Source | What |
-|--------|------|
-| **Yahoo Finance** | Prices, option chains, IV, earnings, news, insider, analyst |
-| **Black-Scholes** | IV solver, Greeks calculation (works off-hours) |
-| **Computed** | RSI-14, MACD, Bollinger Bands, ATR-14, IV rank |
-| **Enhanced** | Unusual activity, put/call ratio, sector rotation, institutional |
-| **Alpaca** *(optional)* | Paper trading validation with real-time Greeks |
+| Source | What | API Key? |
+|--------|------|----------|
+| **Yahoo Finance** | Prices, option chains, IV, earnings, news, insider, analyst | No |
+| **Black-Scholes** | IV solver, Greeks calculation (works off-hours) | No |
+| **Computed** | RSI-14, MACD, Bollinger Bands, ATR-14, IV rank | No |
+| **Enhanced** | Unusual activity, put/call ratio, sector rotation, institutional | No |
+| **Alpha Vantage** *(recommended)* | Company fundamentals (P/E, EPS, margins), Fed rate, CPI, Treasury yield, earnings estimates | **Yes — free** |
+| **Alpaca** *(optional)* | Paper trading validation with real-time Greeks | Yes — free |
+
+### Setting up Alpha Vantage (recommended, 2 minutes)
+
+Alpha Vantage provides fundamentals and macro economic data that Yahoo Finance doesn't cover well. The free tier (25 requests/day) is enough — Alpha Trader caches responses locally.
+
+```bash
+# 1. Get your free API key at https://www.alphavantage.co/support/#api-key
+# 2. Add it to .env
+echo "ALPHAVANTAGE_API_KEY=your_key_here" >> .env
+```
+
+With this key, your `/scan full` briefing will include:
+- **Company fundamentals**: P/E ratio, EPS, revenue growth, profit margin, beta
+- **Macro indicators**: Fed funds rate + trend, 10Y Treasury yield, CPI inflation, unemployment
+- **Earnings history**: Estimated vs actual EPS, surprise %, for the last 8 quarters
+
+Without the key, everything still works — you just won't see these extra data points.
 
 ---
 

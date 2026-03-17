@@ -1,4 +1,12 @@
-"""Load and validate config.yaml."""
+"""Load config.yaml (strategy only) and portfolio.yaml (positions + state).
+
+config.yaml  — strategy params, regimes, schedule, language (shared/template)
+portfolio.yaml — positions, short calls, targets, cash (per-user state)
+
+For backward compat, get_symbols/get_position/get_short_calls/contracts_available
+all read from portfolio.yaml now, but fall back to config.yaml if portfolio.yaml
+doesn't exist yet (pre-migration).
+"""
 
 from __future__ import annotations
 
@@ -6,6 +14,7 @@ import pathlib
 import yaml
 
 CONFIG_PATH = pathlib.Path(__file__).resolve().parent.parent / "config.yaml"
+PORTFOLIO_PATH = pathlib.Path(__file__).resolve().parent.parent / "portfolio.yaml"
 
 
 def load_config(path: pathlib.Path | str | None = None) -> dict:
@@ -14,28 +23,45 @@ def load_config(path: pathlib.Path | str | None = None) -> dict:
         return yaml.safe_load(f)
 
 
+def _load_portfolio() -> dict:
+    """Load portfolio.yaml, fall back to config.yaml positions."""
+    if PORTFOLIO_PATH.exists():
+        with open(PORTFOLIO_PATH) as f:
+            return yaml.safe_load(f) or {}
+    # Fallback: read positions from config.yaml (pre-migration)
+    config = load_config()
+    return {
+        "positions": config.get("positions", {}),
+        "short_calls": config.get("short_calls", []) or [],
+        "weekly_target": config.get("strategy", {}).get("weekly_target", 1500),
+    }
+
+
 def get_symbols(config: dict) -> list[str]:
-    return list(config.get("positions", {}).keys())
+    """Get symbols from portfolio.yaml (or config.yaml fallback)."""
+    pf = _load_portfolio()
+    return list(pf.get("positions", {}).keys())
 
 
 def get_position(config: dict, symbol: str) -> dict:
-    return config.get("positions", {}).get(symbol, {})
+    pf = _load_portfolio()
+    return pf.get("positions", {}).get(symbol, {})
 
 
 def get_short_calls(config: dict) -> list[dict]:
-    return config.get("short_calls", []) or []
+    pf = _load_portfolio()
+    return pf.get("short_calls", []) or []
 
 
 def contracts_available(config: dict, symbol: str) -> int:
-    """How many new contracts can be sold (accounting for existing shorts)."""
-    pos = get_position(config, symbol)
+    pf = _load_portfolio()
+    pos = pf.get("positions", {}).get(symbol, {})
     shares = pos.get("shares", 0)
     max_pct = config.get("strategy", {}).get("max_contracts_pct", 75)
     max_contracts = int(shares / 100 * max_pct / 100)
-
     existing = sum(
         sc.get("contracts", 0)
-        for sc in get_short_calls(config)
+        for sc in (pf.get("short_calls", []) or [])
         if sc.get("symbol") == symbol
     )
     return max(max_contracts - existing, 0)
@@ -63,7 +89,6 @@ def get_language(config: dict) -> str:
 
 
 def set_language(lang_code: str) -> str:
-    """Set output language in config.yaml. Returns display name."""
     import yaml
     if lang_code not in LANGUAGES:
         return ""

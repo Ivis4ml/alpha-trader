@@ -1,28 +1,4 @@
-positions:
-  AAPL:
-    shares: 3000
-    cost_basis: 180.0
-    allow_assignment: false
-  TSLA:
-    shares: 4000
-    cost_basis: 380.0
-    allow_assignment: false
-  NVDA:
-    shares: 1000
-    cost_basis: 45.0
-    allow_assignment: false
-  META:
-    shares: 50
-    cost_basis: 300.0
-    allow_assignment: false
-short_calls:
-- symbol: TSLA
-  strike: 420.0
-  expiry: '2026-03-27'
-  contracts: 5
-  premium_received: 2.97
 strategy:
-  weekly_target: 1500
   auto_regime: true
   dte_range:
   - 3
@@ -35,11 +11,13 @@ strategy:
   target_delta: 0.2
   preferred_dte: 10
   scoring_weights:
-    delta: 0.3
-    premium: 0.25
-    theta: 0.2
+    delta: 0.25
+    premium: 0.2
+    theta: 0.15
     iv: 0.15
     dte: 0.1
+    news: 0.08
+    event: 0.07
   profit_take_pct: 50
   max_loss_multiple: 2.0
   roll_when_dte: 5
@@ -51,7 +29,7 @@ strategy:
       - 0.08
       - 0.15
       vix_below: 15
-      label: "Low IV \u2014 tighter strikes, smaller premium, minimal assignment risk"
+      label: "Low IV \u2014 tighter strikes, minimal assignment risk"
     balanced:
       delta_range:
       - 0.15
@@ -70,4 +48,4 @@ schedule:
   timezone: US/Pacific
   morning: 08:00
   midday: '12:00'
-language: en
+language: zh

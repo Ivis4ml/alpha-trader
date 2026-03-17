@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Alpha Trader shortcut — auto-activates venv
+# Alpha Trader shortcut — auto-activates venv and loads .env
 DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$DIR/.venv/bin/activate"
+if [ -f "$DIR/.env" ]; then
+    set -a
+    source "$DIR/.env"
+    set +a
+fi
 python -m src.cli "$@"

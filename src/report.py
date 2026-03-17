@@ -120,10 +120,14 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
         f"{analyst_str}{tech_str}{unusual_str}{pcr_str}\n"
     )
 
-    # News (compact — top 3, one line each)
+    # News + sentiment
     news = ""
     if briefing.news:
-        news = "**News:** " + " | ".join(n['title'][:60] for n in briefing.news[:3]) + "\n\n"
+        from .data.news import score_news_sentiment
+        sentiment = score_news_sentiment(briefing.news)
+        sent_label = sentiment.get("label", "NEUTRAL")
+        sent_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(sent_label, "")
+        news = f"**News {sent_icon}{sent_label}:** " + " | ".join(n['title'][:60] for n in briefing.news[:3]) + "\n\n"
 
     # Insider (compact)
     insider = ""
@@ -133,10 +137,22 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
             f"{i['date']}: {i['transaction'][:40]}" for i in recent
         ) + "\n\n"
 
+    # Alpha Vantage fundamentals (only in full mode — when news is present)
+    av_fund_str = ""
+    if briefing.news:  # proxy for full mode
+        try:
+            from .data.alphavantage import fetch_fundamentals, format_fundamentals
+            fund = fetch_fundamentals(s.symbol)
+            av_fund_str = format_fundamentals(fund, s.symbol)
+            if av_fund_str:
+                av_fund_str += "\n\n"
+        except Exception:
+            pass
+
     calls = _fmt_option_table(briefing.call_chains, "Call Candidates", delta_lo, delta_hi)
     puts = _fmt_option_table(briefing.put_chains, "Put Candidates", delta_lo, delta_hi, top_n=5)
 
-    return header + "\n" + news + insider + calls + "\n" + puts
+    return header + "\n" + av_fund_str + news + insider + calls + "\n" + puts
 
 
 def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
@@ -160,10 +176,33 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
             for sc in short_calls
         )
 
+    # Macro events
+    from .data.events_calendar import fetch_macro_calendar
+    macro_events = fetch_macro_calendar(lookahead_days=21)
+    macro_str = ""
+    if macro_events:
+        upcoming = [f"{e.event} {e.date[5:]} ({e.days_away}d)" for e in macro_events[:5]]
+        macro_str = f"\n**Upcoming:** {' | '.join(upcoming)}"
+
+    from .portfolio import load_portfolio, get_weekly_target
+    pf = load_portfolio()
+    target = get_weekly_target(pf)
+
+    # Alpha Vantage macro data (if available)
+    av_macro_str = ""
+    if not quick:
+        try:
+            from .data.alphavantage import fetch_macro_snapshot, format_macro_snapshot
+            _progress("Macro indicators (AV)...")
+            macro_data = fetch_macro_snapshot()
+            av_macro_str = "\n" + format_macro_snapshot(macro_data)
+        except Exception:
+            pass
+
     header = dedent(f"""\
     # Alpha Trader Briefing — {mkt.timestamp}
     VIX {mkt.vix} ({'+' if mkt.vix_change >= 0 else ''}{mkt.vix_change}) | SPY ${mkt.spy_price} ({'+' if mkt.spy_change_pct >= 0 else ''}{mkt.spy_change_pct}%) {'↑' if mkt.spy_above_sma20 else '↓'}20SMA | Regime: **{mkt.regime.upper()}** (Δ {delta_lo:.2f}–{delta_hi:.2f})
-    Target: ${config.get('strategy', {}).get('weekly_target', 1500):,}/wk | Open shorts: {short_calls_text}
+    Target: ${target:,}/wk | Open shorts: {short_calls_text}{macro_str}{av_macro_str}
 
     ---
     """)

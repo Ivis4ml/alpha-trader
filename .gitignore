@@ -6,8 +6,10 @@ reports/
 *.egg-info/
 dist/
 build/
+portfolio.yaml
 data/trades.db
 data/trades.db-wal
 data/trades.db-shm
 data/ml_model.joblib
 data/optimizer_log.json
+data/av_cache/

@@ -57,7 +57,7 @@ def cmd_scan(args):
 
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", args.model, briefing],
+            ["claude", "-p", "--model", args.model, "--reasoning-effort", "high", briefing],
             capture_output=True,
             text=True,
             timeout=180,
@@ -88,6 +88,23 @@ def cmd_scan(args):
             print("Sent to Telegram.")
         else:
             print("Telegram notification failed (check .env).")
+
+
+def cmd_setup(args):
+    """Interactive portfolio setup for new users."""
+    from .portfolio import interactive_setup, PORTFOLIO_PATH
+    if PORTFOLIO_PATH.exists() and not args.force:
+        print(f"Portfolio already exists: {PORTFOLIO_PATH}")
+        print("Use --force to overwrite, or edit portfolio.yaml directly.")
+        return
+    interactive_setup()
+
+
+def cmd_portfolio(args):
+    """Show current portfolio state: positions, cash, P&L."""
+    from .portfolio import load_portfolio, format_portfolio_summary
+    p = load_portfolio()
+    print(format_portfolio_summary(p))
 
 
 def cmd_preview(args):
@@ -190,44 +207,28 @@ def cmd_bot(args):
 
 
 def cmd_update_position(args):
-    """Quick helper to update a position in config."""
-    import yaml
-    from .config import CONFIG_PATH
+    """Update a position in portfolio.yaml."""
+    from .portfolio import load_portfolio, save_portfolio
 
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
+    p = load_portfolio()
+    sym = args.symbol.upper()
+    if sym not in p.get("positions", {}):
+        p.setdefault("positions", {})[sym] = {}
 
-    if args.symbol not in config.get("positions", {}):
-        config.setdefault("positions", {})[args.symbol] = {}
-
-    config["positions"][args.symbol]["shares"] = args.shares
+    p["positions"][sym]["shares"] = args.shares
     if args.cost_basis:
-        config["positions"][args.symbol]["cost_basis"] = args.cost_basis
+        p["positions"][sym]["cost_basis"] = args.cost_basis
 
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-    print(f"Updated {args.symbol}: {args.shares} shares")
+    save_portfolio(p)
+    print(f"Updated {sym}: {args.shares:,} shares")
 
 
 def cmd_add_short(args):
     """Record a new short call position."""
-    import yaml
-    from .config import CONFIG_PATH
+    from .portfolio import add_short_call
 
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
-
-    config.setdefault("short_calls", []).append({
-        "symbol": args.symbol,
-        "strike": args.strike,
-        "expiry": args.expiry,
-        "contracts": args.contracts,
-        "premium_received": args.premium,
-    })
-
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    # Save to portfolio.yaml + update cash
+    add_short_call(args.symbol, args.expiry, args.strike, args.contracts, args.premium)
 
     # Record in SQLite trade history
     from .db import record_trade
@@ -241,35 +242,22 @@ def cmd_add_short(args):
         otm_pct=getattr(args, "otm_pct", None),
     )
 
+    total = args.premium * args.contracts * 100
     print(f"Added: SHORT {args.contracts}x {args.symbol} {args.expiry} ${args.strike} Call @ ${args.premium}")
-    print(f"  (trade #{trade_id} recorded in history)")
+    print(f"  Premium collected: ${total:,.2f}")
+    print(f"  (trade #{trade_id} recorded)")
 
 
 def cmd_close_short(args):
-    """Remove a short call from config (expired or closed)."""
-    import yaml
-    from .config import CONFIG_PATH
-
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
-
-    shorts = config.get("short_calls", [])
-    before = len(shorts)
-    config["short_calls"] = [
-        sc for sc in shorts
-        if not (sc.get("symbol") == args.symbol and sc.get("expiry") == args.expiry
-                and sc.get("strike") == args.strike)
-    ]
-    removed = before - len(config["short_calls"])
-
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    """Remove a short call from portfolio (expired or closed)."""
+    from .portfolio import close_short_call
+    close_price = getattr(args, "close_price", None)
+    removed = close_short_call(args.symbol, args.expiry, args.strike, close_price)
 
     # Record close in SQLite trade history
-    if removed > 0:
+    if removed:
         from .db import close_trade
         status = getattr(args, "status", "expired")
-        close_price = getattr(args, "close_price", None)
         close_trade(
             symbol=args.symbol,
             expiry=args.expiry,
@@ -278,7 +266,11 @@ def cmd_close_short(args):
             close_price=close_price,
         )
 
-    print(f"Removed {removed} short call(s) for {args.symbol} {args.expiry} ${args.strike}")
+    print(f"{'Closed' if removed else 'Not found:'} {args.symbol} {args.expiry} ${args.strike}")
+    if removed and close_price:
+        print(f"  Bought to close @ ${close_price}")
+    elif removed:
+        print(f"  Expired worthless — full premium captured")
 
 
 def cmd_report(args):
@@ -466,6 +458,64 @@ def cmd_correlation(args):
     print(f"Analyzing correlation: {', '.join(symbols)}...")
     result = analyze_correlation(symbols)
     print(format_correlation(result))
+
+
+def cmd_news(args):
+    """Portfolio news digest with sentiment scoring."""
+    from .config import load_config, get_symbols
+    from .data.news import fetch_news, score_news_sentiment
+    from .data.events_calendar import fetch_macro_calendar, scan_news_for_risks
+
+    config = load_config(getattr(args, "config", None))
+    symbols = [args.symbol.upper()] if args.symbol else get_symbols(config)
+
+    print("# News Digest\n")
+
+    for sym in symbols:
+        news = fetch_news(sym, max_items=8)
+        if not news:
+            print(f"## {sym} — no recent news\n")
+            continue
+
+        sentiment = score_news_sentiment(news)
+        icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(sentiment["label"], "")
+        print(f"## {sym} {icon} {sentiment['label']} (score: {sentiment['score']:+.2f})\n")
+
+        for i, n in enumerate(news, 1):
+            print(f"  {i}. {n['title']}")
+            if n.get("publisher"):
+                print(f"     — {n['publisher']}")
+
+        # Risk flags from headlines
+        risks = scan_news_for_risks(news)
+        high_risks = [r for r in risks if r.impact == "HIGH"]
+        if high_risks:
+            print(f"\n  ⚠ Risk flags:")
+            for r in high_risks:
+                print(f"    - {r.description[:70]}")
+
+        if sentiment.get("signals"):
+            print(f"\n  Signals: {' | '.join(sentiment['signals'])}")
+        print()
+
+    # Macro events
+    events = fetch_macro_calendar(lookahead_days=14)
+    if events:
+        print("## Macro Calendar (next 14 days)\n")
+        for e in events:
+            icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}.get(e.impact, "")
+            print(f"  {icon} {e.date} — **{e.event}** ({e.days_away}d) {e.description[:50]}")
+        print()
+
+    print("_Ask about any headline for impact analysis._")
+
+
+def cmd_calendar(args):
+    """Show upcoming macro events calendar."""
+    from .data.events_calendar import fetch_macro_calendar, format_event_calendar
+    days = args.days if hasattr(args, "days") else 30
+    events = fetch_macro_calendar(lookahead_days=days)
+    print(format_event_calendar(events))
 
 
 def cmd_earnings_crush(args):
@@ -841,11 +891,27 @@ def cmd_cron(args):
 def main():
     _load_dotenv()
 
+    # Auto-run setup if portfolio.yaml doesn't exist
+    from .portfolio import PORTFOLIO_PATH
+    if not PORTFOLIO_PATH.exists():
+        print("No portfolio found. Let's set one up.\n")
+        from .portfolio import interactive_setup
+        interactive_setup()
+
     parser = argparse.ArgumentParser(
         prog="alpha-trader",
         description="AI-powered covered call & options advisor",
     )
     sub = parser.add_subparsers(dest="command")
+
+    # setup
+    p_setup = sub.add_parser("setup", help="Interactive portfolio setup for new users")
+    p_setup.add_argument("--force", action="store_true", help="Overwrite existing portfolio")
+    p_setup.set_defaults(func=cmd_setup)
+
+    # portfolio
+    p_pf = sub.add_parser("portfolio", help="Show portfolio: positions, cash, P&L")
+    p_pf.set_defaults(func=cmd_portfolio)
 
     # scan
     p_scan = sub.add_parser("scan", help="Fetch data + generate action list")
@@ -906,8 +972,8 @@ def main():
 
     # backtest
     p_bt = sub.add_parser("backtest", help="Simulate covered call strategy on historical data")
-    p_bt.add_argument("--symbol", "-s", default="AMZN,FTNT",
-                       help="Ticker symbol(s), comma-separated (default: AMZN,FTNT)")
+    p_bt.add_argument("--symbol", "-s", default="NVDA,TSLA",
+                       help="Ticker symbol(s), comma-separated (default: NVDA,TSLA)")
     p_bt.add_argument("--shares", type=int, default=3000,
                        help="Number of shares held (default: 3000)")
     p_bt.add_argument("--months", type=int, default=12,
@@ -942,14 +1008,27 @@ def main():
     p_corr.set_defaults(func=cmd_correlation)
 
     # earnings-crush
+    # calendar
+    # news
+    p_news = sub.add_parser("news", help="Portfolio news digest with sentiment")
+    p_news.add_argument("--symbol", "-s", default=None, help="Single symbol (default: all portfolio)")
+    p_news.add_argument("--config", default=None)
+    p_news.set_defaults(func=cmd_news)
+
+    # calendar
+    p_cal = sub.add_parser("calendar", help="Upcoming macro events (FOMC, NFP, CPI, etc.)")
+    p_cal.add_argument("--days", type=int, default=30, help="Lookahead days (default: 30)")
+    p_cal.set_defaults(func=cmd_calendar)
+
+    # earnings-crush
     p_ec = sub.add_parser("earnings-crush", help="Analyze historical IV crush around earnings")
-    p_ec.add_argument("--symbol", "-s", default="AMZN,FTNT")
+    p_ec.add_argument("--symbol", "-s", default="NVDA,TSLA")
     p_ec.set_defaults(func=cmd_earnings_crush)
 
     # spreads — multi-leg strategy scanner
     p_spreads = sub.add_parser("spreads", help="Scan for multi-leg option strategy candidates")
     p_spreads.add_argument("--symbol", "-s", required=True,
-                           help="Ticker symbol (e.g. AMZN)")
+                           help="Ticker symbol (e.g. NVDA)")
     p_spreads.add_argument("--strategy", default=None,
                            choices=["bull-put", "bear-call", "iron-condor", "collar", "pmcc"],
                            help="Specific strategy (default: scan all)")
@@ -984,7 +1063,7 @@ def main():
 
     # iv-surface
     p_iv = sub.add_parser("iv-surface", help="Generate IV surface or smile visualization")
-    p_iv.add_argument("--symbol", "-s", required=True, help="Ticker symbol (e.g. AMZN)")
+    p_iv.add_argument("--symbol", "-s", required=True, help="Ticker symbol (e.g. NVDA)")
     p_iv.add_argument("--smile", action="store_true",
                        help="Generate 2D IV smile for nearest expiry instead of full 3D surface")
     p_iv.add_argument("--no-open", action="store_true",
@@ -1010,7 +1089,7 @@ def main():
     paper_sub.add_parser("status", help="Show account + positions")
 
     p_paper_submit = paper_sub.add_parser("submit", help="Submit covered call (sell-to-open)")
-    p_paper_submit.add_argument("symbol", help="Underlying ticker (e.g. AMZN)")
+    p_paper_submit.add_argument("symbol", help="Underlying ticker (e.g. NVDA)")
     p_paper_submit.add_argument("expiry", help="Expiry YYYY-MM-DD")
     p_paper_submit.add_argument("strike", type=float, help="Strike price")
     p_paper_submit.add_argument("contracts", type=int, help="Number of contracts")
@@ -1052,7 +1131,7 @@ def main():
 
     p_ml_features = ml_sub.add_parser("features", help="Show current feature values")
     p_ml_features.add_argument("--symbol", "-s", required=True,
-                               help="Ticker symbol (e.g. AMZN)")
+                               help="Ticker symbol (e.g. NVDA)")
 
     p_ml.set_defaults(func=cmd_ml)
 

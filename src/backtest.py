@@ -134,7 +134,7 @@ def run_backtest(
     Parameters
     ----------
     symbol : str
-        Ticker symbol (e.g. "AMZN").
+        Ticker symbol (e.g. "NVDA").
     shares : int
         Number of shares held (must be multiple of 100 for covered calls).
     start_date, end_date : str
