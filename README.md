@@ -4,6 +4,9 @@ AI-powered covered call & options advisor built on Claude Code. You make the dec
 
 No broker API. No auto-execution. You see the action list, trade on Robinhood yourself, come back and record what you did.
 
+![alt text](image.png)
+![alt text](image-1.png)
+
 > **23 CLI commands** · **5-factor scoring** · **self-learning optimizer** · **ML signals** · **multi-leg strategies** · **Robinhood-style charts** · **web dashboard** · **iOS Remote** · **6 languages**
 
 ## Quick Start

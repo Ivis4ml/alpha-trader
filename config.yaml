@@ -70,4 +70,4 @@ schedule:
   timezone: US/Pacific
   morning: 08:00
   midday: '12:00'
-language: zh
+language: en
