@@ -230,6 +230,22 @@ def cmd_add_short(args):
     # Save to portfolio.yaml + update cash
     add_short_call(args.symbol, args.expiry, args.strike, args.contracts, args.premium)
 
+    # Capture market context at trade time
+    regime, iv_rank, vix = None, None, None
+    try:
+        from .data.fetcher import fetch_market_context
+        mkt = fetch_market_context()
+        vix = mkt.vix
+        regime = mkt.regime
+    except Exception:
+        pass
+    try:
+        from .data.fetcher import fetch_iv_stats
+        iv_stats = fetch_iv_stats(args.symbol)
+        iv_rank = iv_stats.iv_rank
+    except Exception:
+        pass
+
     # Record in SQLite trade history
     from .db import record_trade
     trade_id = record_trade(
@@ -240,6 +256,9 @@ def cmd_add_short(args):
         premium_per_contract=args.premium,
         delta=getattr(args, "delta", None),
         otm_pct=getattr(args, "otm_pct", None),
+        regime=regime,
+        iv_rank=iv_rank,
+        vix=vix,
     )
 
     total = args.premium * args.contracts * 100
@@ -297,6 +316,15 @@ def cmd_report(args):
             )
         if not weeks:
             print("| (no trades yet) | | | | | |")
+        else:
+            # Rolling average and annual pace
+            premiums = [w["total_premium"] or 0 for w in weeks]
+            rolling_avg = sum(premiums) / len(premiums) if premiums else 0
+            pct = (rolling_avg / weekly_target * 100) if weekly_target else 0
+            annual_pace = rolling_avg * 52
+            print(f"\n**Rolling avg ({len(premiums)}wk):** ${rolling_avg:,.0f}/wk "
+                  f"({pct:.0f}% of ${weekly_target:,.0f} target) | "
+                  f"**Annual pace:** ${annual_pace:,.0f}")
 
     if period in ("monthly", "all"):
         months = get_monthly_summary(months=24 if period == "all" else 6)
@@ -419,6 +447,82 @@ def cmd_daily(args):
     if should_optimize():
         print("Optimization available — run `optimize` to tune parameters.\n")
     print("_Run `/scan` for today's covered call candidates._")
+
+
+def cmd_review(args):
+    """Periodic strategy review — backtest + trade history vs target, suggest adjustments."""
+    from .config import load_config, get_symbols
+    from .db import get_weekly_summary, get_cumulative_pnl
+
+    config = load_config(getattr(args, "config", None))
+    strat = config.get("strategy", {})
+    weekly_target = strat.get("weekly_target", 1500)
+    annual_target = strat.get("annual_target", weekly_target * 52)
+
+    # Use config strategy params as defaults if user didn't override on CLI
+    if args.delta == 0.20 and strat.get("target_delta"):
+        args.delta = strat["target_delta"]
+    if args.dte == 7 and strat.get("preferred_dte"):
+        args.dte = strat["preferred_dte"]
+
+    weeks = get_weekly_summary(weeks=52)
+    cum = get_cumulative_pnl()
+
+    print(f"# Strategy Review — {dt.date.today()}\n")
+    print(f"**Goal:** ${weekly_target:,}/wk avg → ${annual_target:,}/yr\n")
+
+    if weeks:
+        premiums = [w["total_premium"] or 0 for w in weeks]
+        n = len(premiums)
+        rolling_avg = sum(premiums) / n
+        annual_pace = rolling_avg * 52
+        pct = (rolling_avg / weekly_target * 100) if weekly_target else 0
+        gap = annual_target - annual_pace
+
+        print(f"## Performance ({n} weeks of data)\n")
+        print(f"- **Rolling avg:** ${rolling_avg:,.0f}/wk ({pct:.0f}% of target)")
+        print(f"- **Annual pace:** ${annual_pace:,.0f}/yr")
+        if gap > 0:
+            print(f"- **Gap to target:** ${gap:,.0f}/yr (need +${gap/52:,.0f}/wk)")
+        else:
+            print(f"- **Surplus:** ${-gap:,.0f}/yr ahead of target")
+
+        # Best / worst weeks
+        best = max(premiums)
+        worst = min(premiums)
+        zero_weeks = sum(1 for p in premiums if p == 0)
+        print(f"- **Best week:** ${best:,.0f} | **Worst week:** ${worst:,.0f} | **Zero weeks:** {zero_weeks}/{n}")
+
+        # Recent 4-week trend
+        if n >= 4:
+            recent_4 = sum(premiums[:4]) / 4
+            prior_4 = sum(premiums[4:8]) / max(len(premiums[4:8]), 1) if n >= 5 else rolling_avg
+            trend = "improving" if recent_4 > prior_4 else "declining" if recent_4 < prior_4 else "flat"
+            print(f"- **Last 4wk avg:** ${recent_4:,.0f}/wk ({trend} vs prior)")
+
+    if cum and cum.get("total_trades", 0) > 0:
+        print(f"\n## Trade Stats\n")
+        print(f"- Total trades: {cum['total_trades']}")
+        print(f"- Premium collected: ${cum['total_premium_collected']:,.0f}")
+        print(f"- Realized P&L: ${cum['realized_pnl']:,.0f}")
+
+    # Run backtest for comparison
+    symbols = get_symbols(config)
+    print(f"\n## Backtest Comparison\n")
+    print(f"Running {args.months}mo backtest on {', '.join(symbols)}...\n")
+
+    from .backtest import run_backtest, format_summary
+    for sym in symbols:
+        end = dt.date.today()
+        start = end - dt.timedelta(days=args.months * 30)
+        shares = config.get("positions", {}).get(sym, {})
+        n_shares = shares.get("shares", 100) if isinstance(shares, dict) else 100
+        result = run_backtest(sym, start, end, n_shares,
+                              target_delta=args.delta, target_dte=args.dte)
+        print(format_summary(result))
+
+    print("\n---")
+    print("_Run `./at optimize` to auto-tune parameters based on this review._")
 
 
 def cmd_optimize(args):
@@ -846,20 +950,26 @@ def cmd_cron(args):
     if args.action == "install":
         morning = f'0 8 * * 1-5 cd {project_path} && TZ=US/Pacific {cron_script} morning >> {project_path}/reports/cron.log 2>&1'
         midday = f'0 12 * * 1-5 cd {project_path} && TZ=US/Pacific {cron_script} midday >> {project_path}/reports/cron.log 2>&1'
+        # Biweekly review — every other Friday at 4 PM PST
+        review_script = PROJECT_ROOT / "scripts" / "cron_review.sh"
+        review = f'0 16 1-7,15-21 * 5 cd {project_path} && TZ=US/Pacific {review_script} >> {project_path}/reports/cron.log 2>&1'
 
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         existing = result.stdout if result.returncode == 0 else ""
 
-        lines = [l for l in existing.splitlines() if "alpha-trader" not in l and "cron_scan" not in l]
+        lines = [l for l in existing.splitlines()
+                 if "alpha-trader" not in l and "cron_scan" not in l and "cron_review" not in l]
         lines.append("# alpha-trader morning scan")
         lines.append(morning)
         lines.append("# alpha-trader midday scan")
         lines.append(midday)
+        lines.append("# alpha-trader biweekly strategy review")
+        lines.append(review)
 
         new_crontab = "\n".join(lines) + "\n"
         proc = subprocess.run(["crontab", "-"], input=new_crontab, text=True, capture_output=True)
         if proc.returncode == 0:
-            print("Cron jobs installed (Mon-Fri 8AM & 12PM PST)")
+            print("Cron jobs installed (Mon-Fri 8AM & 12PM PST + biweekly review Fri 4PM)")
         else:
             print(f"Failed: {proc.stderr}")
 
@@ -869,7 +979,7 @@ def cmd_cron(args):
             print("No crontab.")
             return
         lines = [l for l in result.stdout.splitlines()
-                 if "alpha-trader" not in l and "cron_scan" not in l]
+                 if "alpha-trader" not in l and "cron_scan" not in l and "cron_review" not in l]
         new_crontab = "\n".join(lines) + "\n" if lines else ""
         subprocess.run(["crontab", "-"], input=new_crontab, text=True)
         print("Cron jobs removed.")
@@ -880,7 +990,7 @@ def cmd_cron(args):
             print("No crontab.")
             return
         found = [l for l in result.stdout.splitlines()
-                 if "alpha-trader" in l or "cron_scan" in l]
+                 if "alpha-trader" in l or "cron_scan" in l or "cron_review" in l]
         if found:
             for l in found:
                 print(f"  {l}")
@@ -990,6 +1100,17 @@ def main():
     p_daily = sub.add_parser("daily", help="Daily review: position advice + alerts")
     p_daily.add_argument("--config", default=None)
     p_daily.set_defaults(func=cmd_daily)
+
+    # review — periodic strategy review (backtest + performance vs target)
+    p_review = sub.add_parser("review", help="Strategy review: performance vs target + backtest")
+    p_review.add_argument("--months", type=int, default=3,
+                          help="Backtest lookback months (default: 3)")
+    p_review.add_argument("--delta", type=float, default=0.20,
+                          help="Backtest target delta (default: 0.20)")
+    p_review.add_argument("--dte", type=int, default=7,
+                          help="Backtest target DTE (default: 7)")
+    p_review.add_argument("--config", default=None)
+    p_review.set_defaults(func=cmd_review)
 
     # optimize
     p_opt = sub.add_parser("optimize", help="Analyze trades and suggest parameter changes")

@@ -20,7 +20,19 @@ PORTFOLIO_PATH = pathlib.Path(__file__).resolve().parent.parent / "portfolio.yam
 def load_config(path: pathlib.Path | str | None = None) -> dict:
     p = pathlib.Path(path) if path else CONFIG_PATH
     with open(p) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+
+    # Unify income_goal → strategy.weekly_target so all code reads one place
+    goal = config.get("income_goal", {})
+    if goal:
+        strat = config.setdefault("strategy", {})
+        strat.setdefault("weekly_target", goal.get("weekly_target", 1500))
+        strat["annual_target"] = goal.get("annual_target", strat.get("weekly_target", 1500) * 52)
+        strat["catchup_cap_pct"] = goal.get("catchup_cap_pct", 200)
+        strat["review_interval"] = goal.get("review_interval", "biweekly")
+        strat["evaluation"] = goal.get("evaluation", "rolling_average")
+
+    return config
 
 
 def _load_portfolio() -> dict:

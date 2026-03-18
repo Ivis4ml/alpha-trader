@@ -71,6 +71,7 @@ scripts/cron_scan.sh   — cron automation (8AM + 12PM PST Mon-Fri)
 ./at ml predict                           # Current signals
 
 # Self-learning
+./at review                               # Strategy review: perf vs target + backtest
 ./at optimize                             # Suggest parameter changes
 
 # Paper trading

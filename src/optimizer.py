@@ -52,8 +52,9 @@ class OptimizationResult:
     delta_buckets: list[BucketStats]
     dte_buckets: list[BucketStats]
     iv_buckets: list[BucketStats]
-    suggestions: list[ParameterSuggestion]
-    weight_suggestions: dict[str, float]  # factor -> suggested weight
+    regime_buckets: list[BucketStats] = field(default_factory=list)
+    suggestions: list[ParameterSuggestion] = field(default_factory=list)
+    weight_suggestions: dict[str, float] = field(default_factory=dict)
 
 
 def _bucket_stats(trades: list[dict], key_fn, bucket_name_fn) -> list[BucketStats]:
@@ -152,8 +153,21 @@ def analyze_and_suggest(config: dict | None = None) -> OptimizationResult:
         lambda d: f"{_dte_bucket(d)}d" if d else "?",
     )
 
-    # IV buckets (we don't store IV at open currently, skip if not available)
-    iv_buckets = []
+    # IV rank buckets (now tracked in trades table)
+    iv_trades = [t for t in closed if t.get("iv_rank") is not None]
+    iv_buckets = _bucket_stats(
+        iv_trades,
+        lambda t: t.get("iv_rank"),
+        lambda iv: f"IV {int(iv // 20) * 20}-{int(iv // 20) * 20 + 20}",
+    ) if iv_trades else []
+
+    # Regime buckets (now tracked in trades table)
+    regime_trades = [t for t in closed if t.get("regime")]
+    regime_buckets = _bucket_stats(
+        regime_trades,
+        lambda t: t.get("regime"),
+        lambda r: r,
+    ) if regime_trades else []
 
     # ── Generate suggestions ──────────────────────────────────────
     suggestions = []
@@ -258,6 +272,7 @@ def analyze_and_suggest(config: dict | None = None) -> OptimizationResult:
         delta_buckets=delta_buckets,
         dte_buckets=dte_buckets,
         iv_buckets=iv_buckets,
+        regime_buckets=regime_buckets,
         suggestions=suggestions,
         weight_suggestions=weight_suggestions,
     )
@@ -315,6 +330,22 @@ def format_optimization(result: OptimizationResult) -> str:
         lines.append("| DTE | Trades | Win Rate | Avg P&L | Total P&L |")
         lines.append("|-----|--------|----------|---------|-----------|")
         for b in result.dte_buckets:
+            lines.append(f"| {b.bucket} | {b.trades} | {b.win_rate}% | ${b.avg_pnl:,.0f} | ${b.total_pnl:,.0f} |")
+        lines.append("")
+
+    if result.regime_buckets:
+        lines.append("### Performance by Market Regime")
+        lines.append("| Regime | Trades | Win Rate | Avg P&L | Total P&L |")
+        lines.append("|--------|--------|----------|---------|-----------|")
+        for b in result.regime_buckets:
+            lines.append(f"| {b.bucket} | {b.trades} | {b.win_rate}% | ${b.avg_pnl:,.0f} | ${b.total_pnl:,.0f} |")
+        lines.append("")
+
+    if result.iv_buckets:
+        lines.append("### Performance by IV Rank")
+        lines.append("| IV Rank | Trades | Win Rate | Avg P&L | Total P&L |")
+        lines.append("|---------|--------|----------|---------|-----------|")
+        for b in result.iv_buckets:
             lines.append(f"| {b.bucket} | {b.trades} | {b.win_rate}% | ${b.avg_pnl:,.0f} | ${b.total_pnl:,.0f} |")
         lines.append("")
 

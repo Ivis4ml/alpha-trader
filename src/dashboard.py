@@ -218,12 +218,29 @@ def api_summary():
         monthly = get_monthly_summary(months=6)
         cumulative = get_cumulative_pnl()
         config = load_config()
-        target = config.get("strategy", {}).get("weekly_target", 1500)
+        strat = config.get("strategy", {})
+        target = strat.get("weekly_target", 1500)
+
+        # Rolling average and pace
+        rolling_avg = 0
+        annual_pace = 0
+        pace_status = "NO_DATA"
+        if weekly:
+            premiums = [w["total_premium"] or 0 for w in weekly]
+            rolling_avg = round(sum(premiums) / len(premiums), 2)
+            annual_pace = round(rolling_avg * 52, 2)
+            pct = (rolling_avg / target * 100) if target else 0
+            pace_status = "ON_TRACK" if pct >= 85 else "BEHIND" if pct >= 50 else "WELL_BEHIND"
+
         return jsonify({
             "weekly": weekly,
             "monthly": monthly,
             "cumulative": cumulative,
             "weekly_target": target,
+            "annual_target": strat.get("annual_target", target * 52),
+            "rolling_avg": rolling_avg,
+            "annual_pace": annual_pace,
+            "pace_status": pace_status,
         })
     except Exception as e:
         return jsonify({
@@ -763,6 +780,14 @@ tr:hover td { background: rgba(79, 195, 247, 0.04); }
       <div class="stat-label">Total Trades</div>
       <div class="stat-value" id="statTotal">--</div>
     </div>
+    <div class="stat-box">
+      <div class="stat-label">Rolling Avg</div>
+      <div class="stat-value" id="statRollingAvg">--</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Annual Pace</div>
+      <div class="stat-value" id="statAnnualPace">--</div>
+    </div>
   </div>
 
   <div class="grid">
@@ -1058,14 +1083,23 @@ async function loadSummary() {
     setText('statOpen', String(c.open_count || 0));
     setText('statTotal', String(c.total_trades || 0));
 
+    // Rolling avg + pace
+    var avgEl = document.getElementById('statRollingAvg');
+    if (avgEl) {
+      avgEl.textContent = fmtDollar(d.rolling_avg || 0, 0) + '/wk';
+      avgEl.className = 'stat-value ' + (d.pace_status === 'ON_TRACK' ? 'positive' : 'negative');
+    }
+    var paceEl = document.getElementById('statAnnualPace');
+    if (paceEl) paceEl.textContent = fmtDollar(d.annual_pace || 0, 0) + '/yr';
+
     // Premium chart
-    renderPremiumChart(d.weekly || [], d.weekly_target);
+    renderPremiumChart(d.weekly || [], d.weekly_target, d.rolling_avg);
   } catch (e) {
     console.error('Summary load error:', e);
   }
 }
 
-function renderPremiumChart(weekly, target) {
+function renderPremiumChart(weekly, target, rollingAvg) {
   var ctx = document.getElementById('premiumChart');
   if (!ctx) return;
 
@@ -1131,6 +1165,19 @@ function renderPremiumChart(weekly, target) {
         ctx2.fillStyle = 'rgba(255,215,0,0.8)';
         ctx2.font = '11px monospace';
         ctx2.fillText('Target $' + target.toLocaleString(), chart.chartArea.right - 100, y - 6);
+        // Rolling average line
+        if (rollingAvg) {
+          var yAvg = yAxis.getPixelForValue(rollingAvg);
+          ctx2.beginPath();
+          ctx2.moveTo(chart.chartArea.left, yAvg);
+          ctx2.lineTo(chart.chartArea.right, yAvg);
+          ctx2.strokeStyle = 'rgba(0,255,136,0.5)';
+          ctx2.lineWidth = 2;
+          ctx2.setLineDash([3, 3]);
+          ctx2.stroke();
+          ctx2.fillStyle = 'rgba(0,255,136,0.7)';
+          ctx2.fillText('Avg $' + rollingAvg.toLocaleString(), chart.chartArea.left + 4, yAvg - 6);
+        }
         ctx2.restore();
       }
     }]

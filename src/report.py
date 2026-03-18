@@ -188,6 +188,20 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
     pf = load_portfolio()
     target = get_weekly_target(pf)
 
+    # Rolling average from trade history
+    rolling_avg_str = ""
+    try:
+        from .db import get_weekly_summary
+        recent_weeks = get_weekly_summary(weeks=8)
+        if recent_weeks:
+            premiums = [w["total_premium"] or 0 for w in recent_weeks]
+            rolling_avg = sum(premiums) / len(premiums)
+            pct_of_target = (rolling_avg / target * 100) if target else 0
+            pace = "ON TRACK" if pct_of_target >= 85 else "BEHIND" if pct_of_target >= 50 else "WELL BEHIND"
+            rolling_avg_str = f" | Rolling avg: ${rolling_avg:,.0f}/wk ({pct_of_target:.0f}% — {pace})"
+    except Exception:
+        pass
+
     # Alpha Vantage macro data (if available)
     av_macro_str = ""
     if not quick:
@@ -202,7 +216,7 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
     header = dedent(f"""\
     # Alpha Trader Briefing — {mkt.timestamp}
     VIX {mkt.vix} ({'+' if mkt.vix_change >= 0 else ''}{mkt.vix_change}) | SPY ${mkt.spy_price} ({'+' if mkt.spy_change_pct >= 0 else ''}{mkt.spy_change_pct}%) {'↑' if mkt.spy_above_sma20 else '↓'}20SMA | Regime: **{mkt.regime.upper()}** (Δ {delta_lo:.2f}–{delta_hi:.2f})
-    Target: ${target:,}/wk | Open shorts: {short_calls_text}{macro_str}{av_macro_str}
+    Target: ${target:,}/wk (yearly avg){rolling_avg_str} | Open shorts: {short_calls_text}{macro_str}{av_macro_str}
 
     ---
     """)
@@ -249,7 +263,7 @@ def _get_policy(config: dict, mkt: MarketContext) -> str:
 
     ### Rules
     - Covered calls on existing shares. RSU positions — minimize assignment risk.
-    - Weekly target: ${strat.get('weekly_target', 1500):,}. Do NOT force bad trades to meet it.
+    - Income goal: ${strat.get('weekly_target', 1500):,}/wk **as a yearly rolling average** (~${strat.get('weekly_target', 1500) * 52:,}/yr). Individual weeks can miss — do NOT force bad trades to hit the weekly number. Judge success by trailing 4-8 week average. If behind pace, lean slightly more aggressive (within regime bounds); if ahead, preserve gains. HARD CAP: never recommend more than ${int(strat.get('weekly_target', 1500) * strat.get('catchup_cap_pct', 200) / 100):,}/wk ({strat.get('catchup_cap_pct', 200)}% of target) in a single week — chasing losses destroys risk management.
     - Regime: {mkt.regime.upper()} → delta {delta_lo:.2f}–{delta_hi:.2f}
     - IV rank < 30 → lean lower delta. IV rank > 50 → lean higher delta.
     - RSI > 70 (overbought): stock may pull back — use higher strike or skip.
@@ -277,7 +291,7 @@ def _get_policy(config: dict, mkt: MarketContext) -> str:
     [each recommended trade as one row]
     | | | | **Total** | | **$X,XXX** | | |
 
-    Target: $X,XXX/wk — MET or NOT MET
+    This week: $X,XXX | Rolling avg: $X,XXX/wk (X% of target) — ON TRACK or BEHIND PACE
 
     ## Risks
     [2-3 bullet points max: earnings proximity, IV environment, trend concerns]

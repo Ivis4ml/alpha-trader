@@ -51,6 +51,16 @@ def _create_tables(conn: sqlite3.Connection):
             symbols         TEXT NOT NULL DEFAULT ''
         );
     """)
+    # Add market context columns if missing (safe migration for existing DBs)
+    for col, coltype in [
+        ("regime", "TEXT"),
+        ("iv_rank", "REAL"),
+        ("vix", "REAL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
@@ -67,6 +77,9 @@ def record_trade(
     delta: float | None = None,
     otm_pct: float | None = None,
     action: str = "sell_call",
+    regime: str | None = None,
+    iv_rank: float | None = None,
+    vix: float | None = None,
 ) -> int:
     """Insert a new trade and return its row id."""
     total_premium = premium_per_contract * contracts * 100
@@ -78,11 +91,11 @@ def record_trade(
             """INSERT INTO trades
                (symbol, action, strike, expiry, contracts,
                 premium_per_contract, total_premium, delta, otm_pct,
-                opened_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+                opened_at, status, regime, iv_rank, vix)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
             (symbol, action, strike, expiry, contracts,
              premium_per_contract, total_premium, delta, otm_pct,
-             opened_at),
+             opened_at, regime, iv_rank, vix),
         )
         conn.commit()
         return cur.lastrowid
