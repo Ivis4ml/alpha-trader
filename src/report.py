@@ -304,10 +304,33 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
         from .roll import analyze_rolls
         roll_section = "\n" + analyze_rolls(config, regime=mkt.regime) + "\n---\n\n"
 
+    # Policy layer: generate and persist daily action slate + backfill
+    action_slate_section = ""
+    try:
+        from .policy import (
+            generate_action_slate, persist_decision, format_action_slate,
+            run_daily_backfill, run_terminal_backfill,
+        )
+        _progress("Generating action slate...")
+        decision = generate_action_slate(scan_result, config)
+        persist_decision(decision)
+        _progress(f"Action slate: {len(decision.actions)} actions (decision {decision.decision_id})")
+
+        # Run backfill on prior open actions
+        _progress("Backfilling prior actions...")
+        n_updated = run_daily_backfill(config, vix=mkt.vix)
+        n_terminal = run_terminal_backfill()
+        if n_updated or n_terminal:
+            _progress(f"Backfill: {n_updated} daily updates, {n_terminal} terminal")
+
+        action_slate_section = "\n" + format_action_slate(decision) + "\n\n---\n\n"
+    except Exception as e:
+        _progress(f"Warning: policy layer failed: {e}")
+
     _progress("Done. Generating analysis...")
     policy = _get_policy(config, mkt)
 
-    return header + "\n".join(sections) + "\n---\n\n" + roll_section + policy
+    return header + "\n".join(sections) + "\n---\n\n" + roll_section + action_slate_section + policy
 
 
 def _get_policy(config: dict, mkt: MarketContext) -> str:

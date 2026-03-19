@@ -70,6 +70,7 @@ class SymbolScanResult:
     symbol: str
     briefing: SymbolBriefing             # raw data for report rendering
     candidates: list[CandidateDecision]  # passed hard filters, sorted by score desc
+    rejected: list[CandidateDecision]    # failed hard filters (for observation logging)
     rejected_count: int                  # how many dropped by hard filters
     symbol_flags: list[str]              # symbol-level context (iv_rank, news, etc.)
 
@@ -79,6 +80,7 @@ class PortfolioScanResult:
     """Full scan across all portfolio symbols."""
     market: MarketContext
     symbols: dict[str, SymbolScanResult]
+    scan_id: str = ""  # populated after observation logging
 
 
 # ---------------------------------------------------------------------------
@@ -323,15 +325,22 @@ def scan_symbol(
         for opt in briefing.call_chains
     ]
 
-    # Hard filter
+    # Hard filter — keep both passed and rejected for observation logging
     passed_features: list[CandidateFeatures] = []
-    rejected_count = 0
+    rejected_decisions: list[CandidateDecision] = []
     decisions: list[CandidateDecision] = []
 
     for feat in features_list:
         reasons = apply_hard_filters(feat, config)
         if reasons:
-            rejected_count += 1
+            rejected_decisions.append(CandidateDecision(
+                features=feat,
+                passed=False,
+                reject_reasons=reasons,
+                score=0.0,
+                breakdown={},
+                flags=[],
+            ))
             continue
         passed_features.append(feat)
 
@@ -387,13 +396,74 @@ def scan_symbol(
         symbol=symbol,
         briefing=briefing,
         candidates=decisions,
-        rejected_count=rejected_count,
+        rejected=rejected_decisions,
+        rejected_count=len(rejected_decisions),
         symbol_flags=sym_flags,
+    )
+
+
+def _candidate_to_observation(d: CandidateDecision) -> dict:
+    """Convert a CandidateDecision to a dict for candidate_observations insert."""
+    f = d.features
+    return {
+        "symbol": f.symbol,
+        "expiry": f.expiry,
+        "strike": f.strike,
+        "stock_price": f.stock_price,
+        "features": {
+            "bid": f.bid,
+            "ask": f.ask,
+            "premium": f.premium,
+            "delta": f.delta,
+            "theta": f.theta,
+            "implied_vol": f.implied_vol,
+            "dte": f.dte,
+            "otm_pct": f.otm_pct,
+            "spread_pct": f.spread_pct,
+            "annualized_yield": f.annualized_yield,
+            "open_interest": f.open_interest,
+            "volume": f.volume,
+            "atr_distance": f.atr_distance,
+            "earnings_gap": f.earnings_gap,
+            "iv_rank": f.iv_rank,
+            "cost_basis": f.cost_basis,
+            "allow_assignment": f.allow_assignment,
+            "off_hours": f.off_hours,
+        },
+        "hard_filter_passed": d.passed,
+        "reject_reasons": d.reject_reasons if d.reject_reasons else None,
+        "score": d.score if d.passed else None,
+        "score_breakdown": d.breakdown if d.breakdown else None,
+        "flags": d.flags if d.flags else None,
+        "iv_rank": f.iv_rank,
+    }
+
+
+def _record_observations(result: PortfolioScanResult, scan_id: str) -> int:
+    """Persist all candidate observations from a scan to the database."""
+    from .db import record_scan_candidates
+
+    all_candidates: list[dict] = []
+    for sym_result in result.symbols.values():
+        for d in sym_result.candidates:
+            all_candidates.append(_candidate_to_observation(d))
+        for d in sym_result.rejected:
+            all_candidates.append(_candidate_to_observation(d))
+
+    if not all_candidates:
+        return 0
+
+    return record_scan_candidates(
+        scan_id=scan_id,
+        candidates=all_candidates,
+        market_regime=result.market.regime,
+        vix=result.market.vix,
     )
 
 
 def scan_portfolio(config: dict, quick: bool = False) -> PortfolioScanResult:
     """Scan all portfolio symbols in parallel."""
+    import uuid
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .config import get_symbols
 
@@ -415,4 +485,17 @@ def scan_portfolio(config: dict, quick: bool = False) -> PortfolioScanResult:
             sym, result = f.result()
             results[sym] = result
 
-    return PortfolioScanResult(market=market, symbols=results)
+    portfolio_result = PortfolioScanResult(market=market, symbols=results)
+
+    # Record all candidates (passed + rejected) for research/modeling
+    scan_id = uuid.uuid4().hex[:12]
+    try:
+        n = _record_observations(portfolio_result, scan_id)
+        if n > 0:
+            _progress(f"Logged {n} candidate observations (scan {scan_id})")
+    except Exception as e:
+        # Non-fatal: observation logging should never break a scan
+        _progress(f"Warning: failed to log observations: {e}")
+
+    portfolio_result.scan_id = scan_id
+    return portfolio_result
