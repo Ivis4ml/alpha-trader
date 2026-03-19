@@ -247,6 +247,64 @@ def format_fundamentals(fund: dict, symbol: str) -> str:
     return " | ".join(parts)
 
 
+# ── News Sentiment ─────────────────────────────────────────────────────────
+
+def fetch_news_sentiment(symbol: str, max_items: int = 5) -> list[dict]:
+    """AV NEWS_SENTIMENT — fresher headlines with built-in sentiment scores."""
+    data = _cached_fetch("NEWS_SENTIMENT", {"tickers": symbol, "limit": "50"}, ttl_hours=4)
+    if not data or "feed" not in data:
+        return []
+
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = now - dt.timedelta(hours=48)
+    results = []
+    for item in data["feed"]:
+        # Parse AV time format "20260319T143000"
+        raw_time = item.get("time_published", "")
+        published = None
+        if raw_time:
+            try:
+                published = dt.datetime.strptime(raw_time, "%Y%m%dT%H%M%S").replace(
+                    tzinfo=dt.timezone.utc
+                )
+            except ValueError:
+                pass
+        if published and published < cutoff:
+            continue
+
+        # Find per-ticker sentiment
+        ticker_sent = {}
+        for ts in item.get("ticker_sentiment", []):
+            if ts.get("ticker", "").upper() == symbol.upper():
+                ticker_sent = ts
+                break
+
+        age_h = (now - published).total_seconds() / 3600 if published else 0
+        if age_h < 1:
+            age_str = f"{int(age_h * 60)}m ago"
+        elif age_h < 24:
+            age_str = f"{int(age_h)}h ago"
+        else:
+            age_str = f"{int(age_h / 24)}d ago"
+
+        results.append({
+            "title": item.get("title", ""),
+            "publisher": item.get("source", ""),
+            "link": item.get("url", ""),
+            "published": published.isoformat() if published else "",
+            "age": age_str,
+            "sentiment_score": _safe_float(ticker_sent.get("ticker_sentiment_score"))
+                               or _safe_float(item.get("overall_sentiment_score"))
+                               or 0.0,
+            "sentiment_label": (ticker_sent.get("ticker_sentiment_label")
+                                or item.get("overall_sentiment_label", "Neutral")),
+            "source": "alphavantage",
+        })
+        if len(results) >= max_items:
+            break
+    return results
+
+
 def _safe_float(v):
     if v is None or v == "None" or v == "-":
         return None

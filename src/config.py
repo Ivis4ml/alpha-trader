@@ -1,11 +1,12 @@
 """Load config.yaml (strategy only) and portfolio.yaml (positions + state).
 
 config.yaml  — strategy params, regimes, schedule, language (shared/template)
-portfolio.yaml — positions, short calls, targets, cash (per-user state)
+portfolio.yaml — positions, short calls, targets, cash (per-user, single-account)
 
-For backward compat, get_symbols/get_position/get_short_calls/contracts_available
-all read from portfolio.yaml now, but fall back to config.yaml if portfolio.yaml
-doesn't exist yet (pre-migration).
+The helpers (get_symbols, get_position, …) always read the repo-local
+portfolio.yaml.  ``--config`` only swaps strategy parameters; it does NOT
+isolate portfolio or trade data.  If multi-account is needed in the future,
+design a dedicated ``--account-dir`` that owns config + portfolio + db together.
 """
 
 from __future__ import annotations
@@ -36,11 +37,11 @@ def load_config(path: pathlib.Path | str | None = None) -> dict:
 
 
 def _load_portfolio() -> dict:
-    """Load portfolio.yaml, fall back to config.yaml positions."""
+    """Load portfolio.yaml (single-account). Falls back to config.yaml positions."""
     if PORTFOLIO_PATH.exists():
         with open(PORTFOLIO_PATH) as f:
             return yaml.safe_load(f) or {}
-    # Fallback: read positions from config.yaml (pre-migration)
+    # Fallback: synthesise from config.yaml positions (pre-migration)
     config = load_config()
     return {
         "positions": config.get("positions", {}),
@@ -50,7 +51,7 @@ def _load_portfolio() -> dict:
 
 
 def get_symbols(config: dict) -> list[str]:
-    """Get symbols from portfolio.yaml (or config.yaml fallback)."""
+    """Get symbols from portfolio.yaml. ``config`` is accepted for API compat only."""
     pf = _load_portfolio()
     return list(pf.get("positions", {}).keys())
 
@@ -77,6 +78,15 @@ def contracts_available(config: dict, symbol: str) -> int:
         if sc.get("symbol") == symbol
     )
     return max(max_contracts - existing, 0)
+
+
+def get_weekly_target(config: dict) -> float:
+    """Return weekly_target, preferring portfolio.yaml over config.yaml."""
+    pf = _load_portfolio()
+    pt = pf.get("weekly_target")
+    if pt:
+        return float(pt)
+    return float(config.get("strategy", {}).get("weekly_target", 1500))
 
 
 def get_delta_range(config: dict, regime: str) -> tuple[float, float]:

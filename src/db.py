@@ -114,15 +114,18 @@ def close_trade(
     closed_at = datetime.now().isoformat()
     conn = _connect()
     try:
-        # Find matching open trades
-        rows = conn.execute(
+        # Find the earliest matching open trade (LIMIT 1 aligns with YAML which
+        # also removes only the first match, preventing state divergence on
+        # partial closes or duplicate symbol/expiry/strike positions).
+        row = conn.execute(
             """SELECT id, premium_per_contract, contracts FROM trades
-               WHERE symbol = ? AND expiry = ? AND strike = ? AND status = 'open'""",
+               WHERE symbol = ? AND expiry = ? AND strike = ? AND status = 'open'
+               ORDER BY id LIMIT 1""",
             (symbol, expiry, strike),
-        ).fetchall()
+        ).fetchone()
 
         updated = 0
-        for row in rows:
+        if row:
             pnl = _calc_pnl(
                 premium_per_contract=row["premium_per_contract"],
                 contracts=row["contracts"],
@@ -135,7 +138,7 @@ def close_trade(
                    WHERE id = ?""",
                 (status, closed_at, close_price, pnl, row["id"]),
             )
-            updated += 1
+            updated = 1
 
         conn.commit()
         return updated
@@ -221,7 +224,7 @@ def get_monthly_summary(months: int = 6) -> list[dict]:
     try:
         rows = conn.execute(
             """SELECT
-                 strftime('%%Y-%%m', opened_at) AS month,
+                 strftime('%Y-%m', opened_at) AS month,
                  SUM(total_premium) AS total_premium,
                  COUNT(*) AS trades_count,
                  GROUP_CONCAT(DISTINCT symbol) AS symbols,

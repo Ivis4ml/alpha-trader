@@ -6,7 +6,7 @@ import sys
 import datetime as dt
 from textwrap import dedent
 
-from .config import load_config, get_symbols, contracts_available, get_short_calls, get_delta_range, get_position, get_language, LANGUAGES
+from .config import load_config, get_symbols, contracts_available, get_short_calls, get_delta_range, get_position, get_language, get_weekly_target, LANGUAGES
 from .data.fetcher import (
     fetch_market_context,
     fetch_symbol_briefing,
@@ -120,14 +120,35 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
         f"{analyst_str}{tech_str}{unusual_str}{pcr_str}\n"
     )
 
-    # News + sentiment
+    # News + sentiment (Yahoo headlines, supplemented by AV when available)
     news = ""
     if briefing.news:
         from .data.news import score_news_sentiment
-        sentiment = score_news_sentiment(briefing.news)
+        all_news = list(briefing.news)
+
+        # Merge AV news (deduped by title prefix) for broader coverage
+        try:
+            from .data.alphavantage import fetch_news_sentiment as _av_news
+            av_items = _av_news(s.symbol, max_items=3)
+            seen = {n["title"][:40].lower() for n in all_news}
+            for av in av_items:
+                if av["title"][:40].lower() not in seen:
+                    all_news.append(av)
+                    seen.add(av["title"][:40].lower())
+        except Exception:
+            pass
+
+        sentiment = score_news_sentiment(all_news)
         sent_label = sentiment.get("label", "NEUTRAL")
         sent_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(sent_label, "")
-        news = f"**News {sent_icon}{sent_label}:** " + " | ".join(n['title'][:60] for n in briefing.news[:3]) + "\n\n"
+
+        # Format with age labels so Claude can weight freshness
+        headlines = []
+        for n in all_news[:5]:
+            age = n.get("age", "")
+            title = n["title"][:60]
+            headlines.append(f"{title} ({age})" if age else title)
+        news = f"**News {sent_icon}{sent_label}:** " + " | ".join(headlines) + "\n\n"
 
     # Insider (compact)
     insider = ""
@@ -184,9 +205,7 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
         upcoming = [f"{e.event} {e.date[5:]} ({e.days_away}d)" for e in macro_events[:5]]
         macro_str = f"\n**Upcoming:** {' | '.join(upcoming)}"
 
-    from .portfolio import load_portfolio, get_weekly_target
-    pf = load_portfolio()
-    target = get_weekly_target(pf)
+    target = get_weekly_target(config)
 
     # Rolling average from trade history
     rolling_avg_str = ""
@@ -229,7 +248,7 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
         return sym, fetch_symbol_briefing(sym, config, quick=quick)
 
     briefings = {}
-    with ThreadPoolExecutor(max_workers=len(symbols)) as pool:
+    with ThreadPoolExecutor(max_workers=max(len(symbols), 1)) as pool:
         futures = {pool.submit(_fetch_one, s): s for s in symbols}
         for f in as_completed(futures):
             sym, b = f.result()
@@ -254,6 +273,8 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
 def _get_policy(config: dict, mkt: MarketContext) -> str:
     strat = config.get("strategy", {})
     delta_lo, delta_hi = get_delta_range(config, mkt.regime)
+    target = get_weekly_target(config)
+    catchup_cap_pct = strat.get('catchup_cap_pct', 200)
 
     return dedent(f"""\
     ## INSTRUCTIONS FOR CLAUDE
@@ -263,7 +284,7 @@ def _get_policy(config: dict, mkt: MarketContext) -> str:
 
     ### Rules
     - Covered calls on existing shares. RSU positions — minimize assignment risk.
-    - Income goal: ${strat.get('weekly_target', 1500):,}/wk **as a yearly rolling average** (~${strat.get('weekly_target', 1500) * 52:,}/yr). Individual weeks can miss — do NOT force bad trades to hit the weekly number. Judge success by trailing 4-8 week average. If behind pace, lean slightly more aggressive (within regime bounds); if ahead, preserve gains. HARD CAP: never recommend more than ${int(strat.get('weekly_target', 1500) * strat.get('catchup_cap_pct', 200) / 100):,}/wk ({strat.get('catchup_cap_pct', 200)}% of target) in a single week — chasing losses destroys risk management.
+    - Income goal: ${target:,.0f}/wk **as a yearly rolling average** (~${target * 52:,.0f}/yr). Individual weeks can miss — do NOT force bad trades to hit the weekly number. Judge success by trailing 4-8 week average. If behind pace, lean slightly more aggressive (within regime bounds); if ahead, preserve gains. HARD CAP: never recommend more than ${int(target * catchup_cap_pct / 100):,}/wk ({catchup_cap_pct}% of target) in a single week — chasing losses destroys risk management.
     - Regime: {mkt.regime.upper()} → delta {delta_lo:.2f}–{delta_hi:.2f}
     - IV rank < 30 → lean lower delta. IV rank > 50 → lean higher delta.
     - RSI > 70 (overbought): stock may pull back — use higher strike or skip.

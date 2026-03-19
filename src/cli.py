@@ -295,10 +295,10 @@ def cmd_close_short(args):
 def cmd_report(args):
     """Show P&L reports from trade history."""
     from .db import get_weekly_summary, get_monthly_summary, get_cumulative_pnl, get_open_trades
-    from .config import load_config
+    from .config import load_config, get_weekly_target
 
     config = load_config(getattr(args, "config", None))
-    weekly_target = config.get("strategy", {}).get("weekly_target", 0)
+    weekly_target = get_weekly_target(config)
 
     period = args.period if hasattr(args, "period") and args.period else "weekly"
 
@@ -451,13 +451,13 @@ def cmd_daily(args):
 
 def cmd_review(args):
     """Periodic strategy review — backtest + trade history vs target, suggest adjustments."""
-    from .config import load_config, get_symbols
+    from .config import load_config, get_symbols, get_position, get_weekly_target
     from .db import get_weekly_summary, get_cumulative_pnl
 
     config = load_config(getattr(args, "config", None))
     strat = config.get("strategy", {})
-    weekly_target = strat.get("weekly_target", 1500)
-    annual_target = strat.get("annual_target", weekly_target * 52)
+    weekly_target = get_weekly_target(config)
+    annual_target = weekly_target * 52
 
     # Use config strategy params as defaults if user didn't override on CLI
     if args.delta == 0.20 and strat.get("target_delta"):
@@ -515,10 +515,9 @@ def cmd_review(args):
     for sym in symbols:
         end = dt.date.today()
         start = end - dt.timedelta(days=args.months * 30)
-        shares = config.get("positions", {}).get(sym, {})
-        n_shares = shares.get("shares", 100) if isinstance(shares, dict) else 100
-        result = run_backtest(sym, start, end, n_shares,
-                              target_delta=args.delta, target_dte=args.dte)
+        n_shares = get_position(config, sym).get("shares", 100)
+        result = run_backtest(sym, n_shares, start.isoformat(), end.isoformat(),
+                              delta_target=args.delta, dte_target=args.dte)
         print(format_summary(result))
 
     print("\n---")
@@ -1001,13 +1000,6 @@ def cmd_cron(args):
 def main():
     _load_dotenv()
 
-    # Auto-run setup if portfolio.yaml doesn't exist
-    from .portfolio import PORTFOLIO_PATH
-    if not PORTFOLIO_PATH.exists():
-        print("No portfolio found. Let's set one up.\n")
-        from .portfolio import interactive_setup
-        interactive_setup()
-
     parser = argparse.ArgumentParser(
         prog="alpha-trader",
         description="AI-powered covered call & options advisor",
@@ -1267,6 +1259,21 @@ def main():
     if not args.command:
         parser.print_help()
         return
+
+    # Auto-run setup only for commands that actually read portfolio data.
+    # Portfolio-independent commands (notify, cron, lang, news, …) work fine
+    # without a portfolio.yaml and must not be interrupted in automation.
+    _NEEDS_PORTFOLIO = {
+        "scan", "preview", "daily", "roll", "portfolio",
+        "update-position", "add-short", "close-short", "review",
+        "backtest", "ml", "alerts", "correlation", "margin",
+        "dashboard", "paper",
+    }
+    from .portfolio import PORTFOLIO_PATH
+    if not PORTFOLIO_PATH.exists() and args.command in _NEEDS_PORTFOLIO:
+        print("No portfolio found. Let's set one up.\n")
+        from .portfolio import interactive_setup
+        interactive_setup()
 
     args.func(args)
 

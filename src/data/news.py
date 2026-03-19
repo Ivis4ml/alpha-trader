@@ -2,25 +2,73 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 import yfinance as yf
 
+# Only keep news published within this window
+_MAX_AGE_HOURS = 48
 
-def fetch_news(symbol: str, max_items: int = 5) -> list[dict]:
-    """Recent news headlines for a symbol."""
+
+def _parse_pub_date(content: dict, item: dict) -> dt.datetime | None:
+    """Extract publish time from yfinance news item."""
+    # New format (>= 0.2.31): ISO string in content.pubDate
+    raw = content.get("pubDate") or item.get("providerPublishTime")
+    if isinstance(raw, str):
+        try:
+            return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if isinstance(raw, (int, float)):
+        # Legacy format: unix timestamp
+        return dt.datetime.fromtimestamp(raw, tz=dt.timezone.utc)
+    return None
+
+
+def _format_age(published: dt.datetime) -> str:
+    """Format a publish time as a human-readable age string like '2h ago'."""
+    delta = dt.datetime.now(dt.timezone.utc) - published
+    hours = delta.total_seconds() / 3600
+    if hours < 1:
+        return f"{int(delta.total_seconds() / 60)}m ago"
+    if hours < 24:
+        return f"{int(hours)}h ago"
+    return f"{int(hours / 24)}d ago"
+
+
+def fetch_news(symbol: str, max_items: int = 8) -> list[dict]:
+    """Recent news headlines for a symbol (filtered to last 48h)."""
     t = yf.Ticker(symbol)
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = now - dt.timedelta(hours=_MAX_AGE_HOURS)
     try:
         raw = t.news or []
         results = []
-        for n in raw[:max_items]:
-            # yfinance >= 0.2.31 uses nested content structure
+        for n in raw:
             content = n.get("content", {})
             title = content.get("title") or n.get("title", "")
             publisher = (content.get("provider", {}).get("displayName")
                          or n.get("publisher", ""))
             link = (content.get("canonicalUrl", {}).get("url")
                     or n.get("link", ""))
-            if title:
-                results.append({"title": title, "publisher": publisher, "link": link})
+            published = _parse_pub_date(content, n)
+
+            if not title:
+                continue
+            # Filter out stale articles
+            if published and published < cutoff:
+                continue
+
+            age_str = _format_age(published) if published else ""
+            results.append({
+                "title": title,
+                "publisher": publisher,
+                "link": link,
+                "published": published.isoformat() if published else "",
+                "age": age_str,
+            })
+            if len(results) >= max_items:
+                break
         return results
     except Exception:
         return []

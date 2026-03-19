@@ -45,13 +45,13 @@ strategy:
       vix_above: 25
       label: "High IV \u2014 fat premiums, accept higher assignment risk"
 income_goal:
-  weekly_target: 1500           # $1,500/wk — measured as yearly rolling avg, NOT strict per-week
-  annual_target: 78000          # 52 × $1,500
-  evaluation: rolling_average   # "rolling_average" = flexible weekly, judge by trailing avg
-  review_interval: biweekly     # run backtest + strategy review every 2 weeks
-  tolerate_miss_weeks: true     # OK to miss individual weeks if yearly avg on track
-  min_floor_week: 0             # $0 weeks happen — don't force bad trades
-  catchup_cap_pct: 200          # max 2x target in a single week to limit risk-chasing
+  weekly_target: 1500
+  annual_target: 78000
+  evaluation: rolling_average
+  review_interval: biweekly
+  tolerate_miss_weeks: true
+  min_floor_week: 0
+  catchup_cap_pct: 200
 schedule:
   timezone: US/Pacific
   morning: 08:00

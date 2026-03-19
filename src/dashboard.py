@@ -12,9 +12,9 @@ import json
 import queue
 import threading
 
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, request
 
-from .config import load_config, get_symbols, get_short_calls, get_position, contracts_available
+from .config import load_config, get_symbols, get_short_calls, get_position, contracts_available, get_weekly_target
 
 app = Flask(__name__)
 
@@ -218,8 +218,7 @@ def api_summary():
         monthly = get_monthly_summary(months=6)
         cumulative = get_cumulative_pnl()
         config = load_config()
-        strat = config.get("strategy", {})
-        target = strat.get("weekly_target", 1500)
+        target = get_weekly_target(config)
 
         # Rolling average and pace
         rolling_avg = 0
@@ -237,7 +236,7 @@ def api_summary():
             "monthly": monthly,
             "cumulative": cumulative,
             "weekly_target": target,
-            "annual_target": strat.get("annual_target", target * 52),
+            "annual_target": target * 52,
             "rolling_avg": rolling_avg,
             "annual_pace": annual_pace,
             "pace_status": pace_status,
