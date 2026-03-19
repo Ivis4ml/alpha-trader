@@ -937,6 +937,94 @@ def cmd_ml(args):
         print("Usage: alpha-trader ml {train|predict|features}")
 
 
+def cmd_learner(args):
+    """Stage 2 candidate ranker — train, evaluate, and report."""
+    action = args.learner_action
+
+    if action == "train":
+        from .candidate_ranker import train_ranker, format_train_result
+
+        print("Training candidate ranker...")
+        try:
+            result = train_ranker()
+            print(format_train_result(result))
+        except ValueError as e:
+            print(f"  Cannot train: {e}")
+
+    elif action == "eval":
+        from .candidate_ranker import is_model_available, get_model_metadata
+        from .candidate_dataset import load_dataset, format_dataset_summary
+        from .db import get_labeled_candidate_count
+
+        stats = get_labeled_candidate_count()
+        print(f"\n  Label coverage:")
+        print(f"    Labeled: {stats.get('labeled', 0)}")
+        print(f"    Unlabeled: {stats.get('unlabeled', 0)}")
+        print(f"    Scan groups: {stats.get('scan_groups', 0)}")
+
+        ds = load_dataset()
+        print(f"\n  Dataset:")
+        print(format_dataset_summary(ds))
+
+        if is_model_available():
+            meta = get_model_metadata()
+            print(f"\n  Trained model:")
+            print(f"    Trained at: {meta.get('trained_at', '?')}")
+            print(f"    Samples: {meta.get('n_samples', '?')}")
+            print(f"    Metrics: {meta.get('metrics', {})}")
+        else:
+            print(f"\n  No trained model yet. Run './at learner train'.")
+        print()
+
+    elif action == "backfill":
+        from .db import backfill_all_unlabeled, get_labeled_candidate_count
+
+        print("Backfilling utility labels for past-expiry candidates...")
+        n = backfill_all_unlabeled()
+        print(f"  Labeled {n} candidates.")
+        stats = get_labeled_candidate_count()
+        print(f"  Total: {stats.get('labeled', 0)} labeled, "
+              f"{stats.get('unlabeled', 0)} unlabeled, "
+              f"{stats.get('scan_groups', 0)} scan groups")
+
+    elif action == "report":
+        from .candidate_ranker import is_model_available, get_model_metadata
+        from .db import get_labeled_candidate_count
+
+        stats = get_labeled_candidate_count()
+        labeled = stats.get("labeled", 0) or 0
+        scans = stats.get("scan_groups", 0) or 0
+
+        print(f"\n{'=' * 55}")
+        print(f"  CANDIDATE RANKER STATUS")
+        print(f"{'=' * 55}")
+        print(f"  Labeled candidates: {labeled}")
+        print(f"  Scan groups: {scans}")
+        print(f"  Training threshold: 500 candidates / 50 scans")
+
+        if labeled >= 500 and scans >= 50:
+            print(f"  → Ready to train")
+        else:
+            need_c = max(0, 500 - labeled)
+            need_s = max(0, 50 - scans)
+            print(f"  → Need {need_c} more candidates / {need_s} more scans")
+
+        if is_model_available():
+            meta = get_model_metadata()
+            metrics = meta.get("metrics", {})
+            print(f"\n  Active model:")
+            print(f"    Trained: {meta.get('trained_at', '?')[:10]}")
+            print(f"    Top-1 uplift: {metrics.get('avg_top1_uplift', 0):+.4f}")
+            print(f"    NDCG@3: {metrics.get('avg_ndcg', 0):.4f}")
+            print(f"    Regret: {metrics.get('avg_regret', 0):.4f}")
+        else:
+            print(f"\n  No trained model.")
+        print(f"{'=' * 55}\n")
+
+    else:
+        print("Usage: alpha-trader learner {train|eval|backfill|report}")
+
+
 def cmd_cron(args):
     """Install or remove cron jobs for automated scanning."""
     cron_script = PROJECT_ROOT / "scripts" / "cron_scan.sh"
@@ -1248,6 +1336,15 @@ def main():
 
     p_ml.set_defaults(func=cmd_ml)
 
+    # learner (Stage 2 candidate ranker)
+    p_learner = sub.add_parser("learner", help="Stage 2 candidate ranker: train, evaluate, backfill labels")
+    learner_sub = p_learner.add_subparsers(dest="learner_action")
+    learner_sub.add_parser("train", help="Train candidate ranker on labeled observations")
+    learner_sub.add_parser("eval", help="Show dataset stats and model evaluation")
+    learner_sub.add_parser("backfill", help="Backfill utility labels for past-expiry candidates")
+    learner_sub.add_parser("report", help="Readiness report for candidate ranker")
+    p_learner.set_defaults(func=cmd_learner)
+
     # report
     p_report = sub.add_parser("report", help="Show P&L summaries from trade history")
     p_report.add_argument("period", nargs="?", choices=["weekly", "monthly", "all"],
@@ -1266,7 +1363,7 @@ def main():
     _NEEDS_PORTFOLIO = {
         "scan", "preview", "daily", "roll", "portfolio",
         "update-position", "add-short", "close-short", "review",
-        "backtest", "ml", "alerts", "correlation", "margin",
+        "backtest", "ml", "learner", "alerts", "correlation", "margin",
         "dashboard", "paper",
     }
     from .portfolio import PORTFOLIO_PATH

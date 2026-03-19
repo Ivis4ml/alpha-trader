@@ -59,9 +59,11 @@ class CandidateDecision:
     features: CandidateFeatures
     passed: bool
     reject_reasons: list[str]
-    score: float
+    score: float                 # final score (heuristic or blended)
     breakdown: dict[str, float]  # income, assignment_risk, execution_quality, event_risk
     flags: list[str]
+    heuristic_score: float = 0.0  # pure heuristic score (always set)
+    model_score: float | None = None  # learner score (None if no model)
 
 
 @dataclass
@@ -298,6 +300,80 @@ def score_candidate(
 
 
 # ---------------------------------------------------------------------------
+# Learner integration
+# ---------------------------------------------------------------------------
+
+def _apply_learner_scores(
+    decisions: list[CandidateDecision],
+    config: dict,
+    vix: float | None = None,
+) -> None:
+    """If a trained ranker exists, predict model_score and blend into final score.
+
+    Shadow mode (model_weight=0): computes model_score but doesn't change ranking.
+    Active mode (model_weight>0): blends heuristic + model via combine_scores().
+    """
+    if not decisions:
+        return
+
+    try:
+        from .candidate_ranker import is_model_available, predict_candidate_scores
+        if not is_model_available():
+            return
+    except ImportError:
+        return
+
+    strat = config.get("strategy", {})
+    model_weight = strat.get("learner_model_weight", 0.0)
+
+    import pandas as pd
+    from .candidate_dataset import _safe_div, _cost_basis_buffer
+
+    # Build feature DataFrame matching training columns
+    rows = []
+    for d in decisions:
+        f = d.features
+        rows.append({
+            "premium": f.premium,
+            "delta": f.delta,
+            "theta": f.theta,
+            "implied_vol": f.implied_vol,
+            "dte": f.dte,
+            "otm_pct": f.otm_pct,
+            "spread_pct": f.spread_pct,
+            "annualized_yield": f.annualized_yield,
+            "open_interest": f.open_interest,
+            "volume": f.volume,
+            "atr_distance": f.atr_distance,
+            "earnings_gap": f.earnings_gap,
+            "iv_rank": f.iv_rank,
+            "vix": vix,
+            "sb_income": d.breakdown.get("income"),
+            "sb_assignment_risk": d.breakdown.get("assignment_risk"),
+            "sb_execution_quality": d.breakdown.get("execution_quality"),
+            "sb_event_risk": d.breakdown.get("event_risk"),
+            "bid_ask_ratio": _safe_div(f.bid, f.ask),
+            "premium_to_atr": _safe_div(f.premium, f.atr_distance),
+            "cost_basis_buffer": _cost_basis_buffer(f.cost_basis, f.strike, f.stock_price),
+        })
+
+    features_df = pd.DataFrame(rows)
+
+    try:
+        model_scores = predict_candidate_scores(features_df)
+    except Exception:
+        return
+
+    # Apply scores
+    from .policy import combine_scores
+    for i, d in enumerate(decisions):
+        d.model_score = round(float(model_scores[i]), 4)
+        if model_weight > 0:
+            d.score = round(combine_scores(d.heuristic_score, d.model_score, model_weight), 4)
+        d.breakdown["model_score"] = d.model_score
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -375,9 +451,13 @@ def scan_symbol(
             score=score,
             breakdown=breakdown,
             flags=flags,
+            heuristic_score=score,
         ))
 
-    # Sort by score descending
+    # Learner scoring: if a trained ranker exists, blend model_score
+    _apply_learner_scores(decisions, config, vix=market.vix)
+
+    # Sort by final score descending
     decisions.sort(key=lambda d: d.score, reverse=True)
 
     # Symbol-level flags (for context, not scoring)
@@ -432,7 +512,9 @@ def _candidate_to_observation(d: CandidateDecision) -> dict:
         },
         "hard_filter_passed": d.passed,
         "reject_reasons": d.reject_reasons if d.reject_reasons else None,
-        "score": d.score if d.passed else None,
+        # Always store the pure heuristic score, not the blended score.
+        # This prevents model contamination in training baselines.
+        "score": d.heuristic_score if d.passed else None,
         "score_breakdown": d.breakdown if d.breakdown else None,
         "flags": d.flags if d.flags else None,
         "iv_rank": f.iv_rank,

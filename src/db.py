@@ -77,7 +77,15 @@ def _create_tables(conn: sqlite3.Connection):
             chosen_by_llm   INTEGER NOT NULL DEFAULT 0,
             chosen_by_user  INTEGER NOT NULL DEFAULT 0,
             -- Outcome tracking (filled after expiry via backfill)
-            realized_outcome TEXT
+            realized_outcome TEXT,
+            -- Structured outcome fields for Stage 2 learner
+            outcome_source  TEXT,           -- realized | counterfactual
+            terminal_pnl    REAL,
+            assigned        INTEGER,        -- 1 if stock > strike at expiry
+            expired_otm     INTEGER,        -- 1 if stock <= strike at expiry
+            stock_at_expiry REAL,           -- stock price used for outcome calc
+            utility_label   REAL,           -- the training label for learner
+            label_confidence TEXT            -- high | medium | low
         );
 
         CREATE INDEX IF NOT EXISTS idx_cobs_scan_id ON candidate_observations(scan_id);
@@ -193,6 +201,20 @@ def _create_tables(conn: sqlite3.Connection):
     ]:
         try:
             conn.execute(f"ALTER TABLE policy_actions ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass
+    # Add structured outcome columns to candidate_observations (safe migration)
+    for col, coltype in [
+        ("outcome_source", "TEXT"),
+        ("terminal_pnl", "REAL"),
+        ("assigned", "INTEGER"),
+        ("expired_otm", "INTEGER"),
+        ("stock_at_expiry", "REAL"),
+        ("utility_label", "REAL"),
+        ("label_confidence", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE candidate_observations ADD COLUMN {col} {coltype}")
         except sqlite3.OperationalError:
             pass
     conn.commit()
@@ -537,46 +559,264 @@ def mark_chosen(scan_id: str, symbol: str, strike: float, expiry: str,
         conn.close()
 
 
-def backfill_outcomes(expiry: str) -> int:
-    """Backfill realized outcomes for candidates with a given expiry date.
+def backfill_outcomes(expiry: str, stock_prices_at_expiry: dict[str, float] | None = None) -> int:
+    """Backfill outcomes for ALL passed candidates with a given expiry date.
 
-    Matches against the trades table to determine what actually happened.
-    For candidates that weren't traded, checks if the stock closed above/below
-    the strike (requires stock price at expiry — caller provides via update).
+    Two paths:
+    1. Realized: candidates that match a closed trade → use actual PnL.
+    2. Counterfactual: passed candidates NOT traded → estimate outcome from
+       stock price at expiry (provided by caller or fetched).
 
-    Returns the number of rows updated.
+    Both paths fill the structured outcome columns (terminal_pnl, assigned,
+    expired_otm, utility_label, label_confidence) used by Stage 2 learner.
+
+    Parameters
+    ----------
+    expiry : str
+        ISO date "YYYY-MM-DD" — the expiry to backfill.
+    stock_prices_at_expiry : dict, optional
+        {symbol: price_at_expiry}. If not provided, tries to fetch from yfinance.
+
+    Returns the total number of rows updated.
     """
     conn = _connect()
     try:
-        # For candidates that WERE traded: join with trades table
-        cur = conn.execute(
-            """UPDATE candidate_observations SET realized_outcome = (
-                 SELECT json_object(
-                   'traded', 1,
-                   'status', t.status,
-                   'pnl', t.pnl,
-                   'premium_collected', t.total_premium
-                 )
-                 FROM trades t
-                 WHERE t.symbol = candidate_observations.symbol
-                   AND t.expiry = candidate_observations.expiry
-                   AND t.strike = candidate_observations.strike
-                   AND t.status != 'open'
-               )
-               WHERE expiry = ?
-                 AND realized_outcome IS NULL
-                 AND EXISTS (
-                   SELECT 1 FROM trades t
-                   WHERE t.symbol = candidate_observations.symbol
-                     AND t.expiry = candidate_observations.expiry
-                     AND t.strike = candidate_observations.strike
-                     AND t.status != 'open'
-                 )""",
+        updated = 0
+
+        # ── Path 1: Realized — 1:1 match each trade to closest observation ──
+        # For each closed trade with this expiry, find the single closest
+        # unlabeled observation by scan_ts. This prevents one trade from
+        # labeling multiple observations of the same contract across days.
+        trades_for_expiry = conn.execute(
+            """SELECT id, symbol, strike, expiry, pnl, status,
+                      total_premium, contracts, opened_at
+               FROM trades
+               WHERE expiry = ? AND status != 'open'""",
             (expiry,),
-        )
-        updated = cur.rowcount
+        ).fetchall()
+
+        for trade in trades_for_expiry:
+            t = dict(trade)
+            contracts = t.get("contracts") or 1
+
+            # Find the single best unlabeled observation for this trade.
+            # Priority 1: user explicitly chose this candidate (chosen_by_user=1)
+            # Priority 2: scan happened BEFORE the trade (scan_ts <= opened_at)
+            #             within a 2-day window — no lookahead.
+            # This prevents labeling future scans or distant past observations.
+            best = conn.execute(
+                """SELECT co.id, co.features,
+                          julianday(?) - julianday(co.scan_ts) AS days_before_trade
+                   FROM candidate_observations co
+                   WHERE co.symbol = ? AND co.strike = ? AND co.expiry = ?
+                     AND co.hard_filter_passed = 1
+                     AND co.utility_label IS NULL
+                     AND co.scan_ts <= ?
+                     AND julianday(?) - julianday(co.scan_ts) <= 2
+                   ORDER BY co.chosen_by_user DESC, days_before_trade ASC
+                   LIMIT 1""",
+                (t["opened_at"], t["symbol"], t["strike"], t["expiry"],
+                 t["opened_at"], t["opened_at"]),
+            ).fetchone()
+
+            if not best:
+                continue
+
+            b = dict(best)
+            pnl = t["pnl"] or 0
+            features = json.loads(b["features"]) if b["features"] else {}
+            entry_premium = features.get("premium", 0)
+
+            # Normalize PnL to per-share using actual contracts
+            pnl_per_share = pnl / max(contracts * 100, 1)
+
+            was_assigned = t["status"] == "assigned"
+            utility = _compute_utility_label(
+                entry_premium=entry_premium,
+                terminal_pnl=pnl_per_share,
+                assigned=was_assigned,
+            )
+
+            conn.execute(
+                """UPDATE candidate_observations
+                   SET outcome_source = 'realized',
+                       terminal_pnl = ?,
+                       assigned = ?,
+                       expired_otm = ?,
+                       utility_label = ?,
+                       label_confidence = 'high',
+                       realized_outcome = json_object(
+                         'traded', 1, 'status', ?, 'pnl_per_share', ?,
+                         'contracts', ?
+                       )
+                   WHERE id = ?""",
+                (round(pnl_per_share * 100, 2),  # per-contract PnL
+                 1 if was_assigned else 0,
+                 0 if was_assigned else 1,
+                 utility, t["status"], round(pnl_per_share, 4),
+                 contracts, b["id"]),
+            )
+            updated += 1
+
+        # ── Path 2: Counterfactual — passed candidates NOT traded ──
+        # Get stock prices at expiry for counterfactual pricing
+        if stock_prices_at_expiry is None:
+            stock_prices_at_expiry = {}
+            symbols_needed = conn.execute(
+                """SELECT DISTINCT symbol FROM candidate_observations
+                   WHERE expiry = ? AND hard_filter_passed = 1
+                     AND utility_label IS NULL""",
+                (expiry,),
+            ).fetchall()
+            for sym_row in symbols_needed:
+                sym = sym_row[0]
+                if sym not in stock_prices_at_expiry:
+                    try:
+                        import yfinance as yf
+                        import datetime as _dt
+                        exp_date = _dt.date.fromisoformat(expiry)
+                        # Fetch price on or near expiry date
+                        start = (exp_date - _dt.timedelta(days=3)).isoformat()
+                        end = (exp_date + _dt.timedelta(days=3)).isoformat()
+                        hist = yf.Ticker(sym).history(start=start, end=end)
+                        if not hist.empty:
+                            # Get the closest price to expiry
+                            stock_prices_at_expiry[sym] = float(hist["Close"].iloc[-1])
+                    except Exception:
+                        pass
+
+        # Fill counterfactual outcomes for remaining unlabeled passed candidates
+        remaining = conn.execute(
+            """SELECT id, symbol, strike, features, stock_price
+               FROM candidate_observations
+               WHERE expiry = ?
+                 AND hard_filter_passed = 1
+                 AND utility_label IS NULL""",
+            (expiry,),
+        ).fetchall()
+
+        for row in remaining:
+            r = dict(row)
+            sym = r["symbol"]
+            strike = r["strike"]
+            price_at_expiry = stock_prices_at_expiry.get(sym)
+
+            if price_at_expiry is None:
+                continue  # can't label without price
+
+            features = json.loads(r["features"]) if r["features"] else {}
+            entry_premium = features.get("premium", 0)
+
+            was_assigned = price_at_expiry > strike
+            if was_assigned:
+                # Short call assigned: premium - intrinsic value
+                pnl_per_share = entry_premium - (price_at_expiry - strike)
+            else:
+                # Expired OTM: kept full premium
+                pnl_per_share = entry_premium
+
+            # Apply friction for counterfactual (3% slippage on entry premium)
+            pnl_per_share -= entry_premium * 0.03
+
+            utility = _compute_utility_label(
+                entry_premium=entry_premium,
+                terminal_pnl=pnl_per_share,
+                assigned=was_assigned,
+            )
+
+            conn.execute(
+                """UPDATE candidate_observations
+                   SET outcome_source = 'counterfactual',
+                       terminal_pnl = ?,
+                       assigned = ?,
+                       expired_otm = ?,
+                       stock_at_expiry = ?,
+                       utility_label = ?,
+                       label_confidence = 'medium',
+                       realized_outcome = json_object(
+                         'traded', 0, 'counterfactual', 1,
+                         'stock_at_expiry', ?, 'pnl_per_share', ?
+                       )
+                   WHERE id = ?""",
+                (round(pnl_per_share * 100, 2),  # per-contract PnL
+                 1 if was_assigned else 0,
+                 0 if was_assigned else 1,
+                 round(price_at_expiry, 2),
+                 utility,
+                 round(price_at_expiry, 2),
+                 round(pnl_per_share, 4),
+                 r["id"]),
+            )
+            updated += 1
+
         conn.commit()
         return updated
+    finally:
+        conn.close()
+
+
+def _compute_utility_label(
+    entry_premium: float,
+    terminal_pnl: float,
+    assigned: bool,
+    assignment_penalty_lambda: float = 0.5,
+) -> float:
+    """Compute the utility label for a candidate observation.
+
+    utility = premium_captured - λ * assignment_penalty
+
+    This is the target variable for the Stage 2 ranker. Normalized
+    to per-share scale so it's comparable across different stock prices.
+    """
+    if entry_premium <= 0:
+        return 0.0
+
+    # Premium capture ratio: 1.0 = kept everything, negative = net loss
+    capture_ratio = terminal_pnl / entry_premium
+
+    # Assignment penalty: only kicks in when assigned
+    penalty = assignment_penalty_lambda if assigned else 0.0
+
+    return round(capture_ratio - penalty, 4)
+
+
+def backfill_all_unlabeled() -> int:
+    """Batch-backfill all past-expiry candidates that lack utility labels."""
+    import datetime as _dt
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT expiry FROM candidate_observations
+               WHERE hard_filter_passed = 1 AND utility_label IS NULL
+                 AND expiry < ?""",
+            (_dt.date.today().isoformat(),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    total = 0
+    for row in rows:
+        try:
+            total += backfill_outcomes(row[0])
+        except Exception:
+            continue
+    return total
+
+
+def get_labeled_candidate_count() -> dict:
+    """Count labeled vs unlabeled passed candidates for training readiness."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN utility_label IS NOT NULL THEN 1 ELSE 0 END) AS labeled,
+                 SUM(CASE WHEN utility_label IS NULL THEN 1 ELSE 0 END) AS unlabeled,
+                 COUNT(DISTINCT scan_id) AS scan_groups,
+                 COUNT(*) AS total_passed
+               FROM candidate_observations
+               WHERE hard_filter_passed = 1"""
+        ).fetchone()
+        return dict(row) if row else {}
     finally:
         conn.close()
 
