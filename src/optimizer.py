@@ -232,24 +232,31 @@ def analyze_and_suggest(config: dict | None = None) -> OptimizationResult:
             ))
 
     # ── Scoring weight suggestions (correlation-based) ────────────
+    # Map trade features to the 4 scoring categories in scan_engine:
+    #   income         ← premium_per_contract (proxy for yield + theta)
+    #   assignment_risk← delta (proxy for delta + OTM + ATR)
+    #   execution_quality ← spread at entry (not currently tracked, skip)
+    #   event_risk     ← DTE proxy (longer DTE = more event exposure)
     weight_suggestions = {}
     if len(closed) >= 15:
-        # Build feature matrix: [delta_score_proxy, premium, theta_proxy, iv_proxy, dte_proxy]
-        # and correlate each with P&L
         pnls = []
-        features = {"delta": [], "premium": [], "dte": []}
+        features = {
+            "income": [],
+            "assignment_risk": [],
+            "event_risk": [],
+        }
 
         for t in closed:
             pnl = t.get("pnl", 0) or 0
             pnls.append(pnl)
-            features["delta"].append(t.get("delta") or 0.20)
-            features["premium"].append(t.get("premium_per_contract", 0) or 0)
+            features["income"].append(t.get("premium_per_contract", 0) or 0)
+            features["assignment_risk"].append(t.get("delta") or 0.20)
             try:
                 exp = dt.datetime.strptime(t["expiry"], "%Y-%m-%d").date()
                 opened = dt.datetime.fromisoformat(t["opened_at"]).date()
-                features["dte"].append((exp - opened).days)
+                features["event_risk"].append((exp - opened).days)
             except Exception:
-                features["dte"].append(10)
+                features["event_risk"].append(10)
 
         pnl_arr = np.array(pnls)
         if pnl_arr.std() > 0:
@@ -259,6 +266,9 @@ def analyze_and_suggest(config: dict | None = None) -> OptimizationResult:
                 if feat_arr.std() > 0:
                     corr = np.corrcoef(feat_arr, pnl_arr)[0, 1]
                     corrs[feat_name] = abs(corr)
+
+            # Add execution_quality with neutral weight (no trade-level spread data)
+            corrs.setdefault("execution_quality", 0.10)
 
             # Normalize correlations to sum to 1 for weight suggestion
             total_corr = sum(corrs.values())

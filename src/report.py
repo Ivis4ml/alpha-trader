@@ -1,4 +1,8 @@
-"""Generate structured briefing text for Claude analysis."""
+"""Generate structured briefing text for Claude analysis.
+
+report.py is a pure render layer — it takes scan_engine output and formats
+it into markdown that both humans (--data-only) and Claude can read.
+"""
 
 from __future__ import annotations
 
@@ -6,55 +10,96 @@ import sys
 import datetime as dt
 from textwrap import dedent
 
-from .config import load_config, get_symbols, contracts_available, get_short_calls, get_delta_range, get_position, get_language, get_weekly_target, LANGUAGES
-from .data.fetcher import (
-    fetch_market_context,
-    fetch_symbol_briefing,
-    MarketContext,
-    SymbolBriefing,
+from .config import (
+    load_config, get_symbols, contracts_available, get_short_calls,
+    get_delta_range, get_position, get_language, get_weekly_target, LANGUAGES,
+)
+from .data.fetcher import MarketContext, SymbolBriefing
+from .scan_engine import (
+    CandidateDecision, SymbolScanResult, PortfolioScanResult, scan_portfolio,
 )
 
 
 def _progress(msg: str):
-    """Print progress to stderr so it streams in real-time without polluting stdout."""
     print(f"  ⏳ {msg}", file=sys.stderr, flush=True)
 
 
-def _fmt_option_table(rows, label: str, delta_lo: float, delta_hi: float, top_n: int = 10) -> str:
-    """Format top N option candidates into a compact table."""
-    if not rows:
-        return f"No {label} candidates match filters.\n"
+# ---------------------------------------------------------------------------
+# Option table formatting
+# ---------------------------------------------------------------------------
 
-    # Sort by delta proximity to target range midpoint, then filter top N
-    target_mid = (delta_lo + delta_hi) / 2
-    ranked = sorted(rows, key=lambda r: abs(abs(r.greeks.delta) - target_mid))
-    top = ranked[:top_n]
-    # Re-sort by expiry/strike for display
-    top.sort(key=lambda r: (r.expiry, r.strike))
+def _fmt_scored_table(candidates: list[CandidateDecision], label: str, top_n: int = 10) -> str:
+    """Format scored call candidates into a table with score breakdown + flags."""
+    if not candidates:
+        return f"No {label} match filters.\n"
 
-    off_hours = any(r.off_hours for r in top)
+    top = candidates[:top_n]
+    off_hours = any(d.features.off_hours for d in top)
+
     lines = [f"### {label}"]
     if off_hours:
         lines.append("*(Market closed — last traded prices)*")
     lines.append("")
-    lines.append("| Expiry | Strike | Price | Delta | Theta | IV% | OI | Vol | Yield% | OTM% | Fit |")
-    lines.append("|--------|--------|-------|-------|-------|-----|-----|-----|--------|------|-----|")
+    lines.append(
+        "| Expiry | Strike | Price | Score | Income | Risk | Quality | Event "
+        "| Delta | Theta | Yield% | OTM% | ATR | Flags |"
+    )
+    lines.append(
+        "|--------|--------|-------|-------|--------|------|---------|-------"
+        "|-------|-------|--------|------|-----|-------|"
+    )
+
+    for d in top:
+        f = d.features
+        b = d.breakdown
+        atr_str = f"{f.atr_distance:.1f}" if f.atr_distance is not None else "?"
+        flags_str = " ".join(d.flags)
+        lines.append(
+            f"| {f.expiry[5:]} | {f.strike:.1f} | {f.premium:.2f} "
+            f"| {int(d.score * 100):>3d} "
+            f"| {b.get('income', 0):.2f} | {b.get('assignment_risk', 0):.2f} "
+            f"| {b.get('execution_quality', 0):.2f} | {b.get('event_risk', 0):.2f} "
+            f"| {f.delta:.2f} | {f.theta:.3f} | {f.annualized_yield:.1f} "
+            f"| {f.otm_pct:.1f} | {atr_str} | {flags_str} |"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _fmt_option_table(rows, label: str, delta_lo: float, delta_hi: float, top_n: int = 5) -> str:
+    """Format put candidates (unscored, secondary strategy)."""
+    if not rows:
+        return f"No {label} candidates match filters.\n"
+
+    target_mid = (delta_lo + delta_hi) / 2
+    ranked = sorted(rows, key=lambda r: abs(abs(r.greeks.delta) - target_mid))
+    top = ranked[:top_n]
+    top.sort(key=lambda r: (r.expiry, r.strike))
+
+    lines = [f"### {label}", ""]
+    lines.append("| Expiry | Strike | Price | Delta | Theta | IV% | OI | Yield% | OTM% |")
+    lines.append("|--------|--------|-------|-------|-------|-----|-----|--------|------|")
 
     for r in top:
         d = abs(r.greeks.delta)
-        fit = ">>>" if delta_lo <= d <= delta_hi else ""
         price = r.last if r.off_hours else r.bid
         lines.append(
             f"| {r.expiry[5:]} | {r.strike:.1f} | {price:.2f} | "
             f"{d:.2f} | {r.greeks.theta:.3f} | {r.implied_vol:.0f} | "
-            f"{r.open_interest} | {r.volume} | {r.annualized_yield:.1f} | {r.otm_pct:.1f} | {fit} |"
+            f"{r.open_interest} | {r.annualized_yield:.1f} | {r.otm_pct:.1f} |"
         )
     lines.append("")
     return "\n".join(lines)
 
 
-def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> str:
-    """Compact per-symbol section: one-line summary + filtered candidates."""
+# ---------------------------------------------------------------------------
+# Per-symbol section
+# ---------------------------------------------------------------------------
+
+def _fmt_symbol_section(result: SymbolScanResult, config: dict, regime: str) -> str:
+    """Render one symbol: header + context + scored call table + put table."""
+    briefing = result.briefing
     s = briefing.stock
     iv = briefing.iv_stats
     ev = briefing.events
@@ -97,7 +142,7 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
 
         tech_str = f"\n**Technicals:** {rsi_part}{macd_part}{bb_part}{atr_part}"
 
-    # Unusual options activity (only if any found)
+    # Unusual options activity
     unusual_str = ""
     if briefing.unusual_activity:
         alerts = []
@@ -112,21 +157,25 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
         sentiment = "BEARISH" if briefing.put_call_ratio > 1.0 else ("BULLISH" if briefing.put_call_ratio < 0.7 else "NEUTRAL")
         pcr_str = f"\n**P/C Ratio:** {briefing.put_call_ratio:.2f} ({sentiment})"
 
+    # Symbol-level scan flags
+    sym_flags_str = ""
+    if result.symbol_flags:
+        sym_flags_str = f"\n**Scan:** {' | '.join(result.symbol_flags)} | {result.rejected_count} candidates filtered"
+
     header = (
         f"## {s.symbol} — ${s.price:.2f} ({'+' if s.day_change_pct >= 0 else ''}"
         f"{s.day_change_pct:.1f}%) {trend}20SMA | "
         f"IV Rank {iv.iv_rank:.0f}% | {earnings_str} | "
         f"{pos.get('shares', 0):,} shares ({avail} contracts avail)"
-        f"{analyst_str}{tech_str}{unusual_str}{pcr_str}\n"
+        f"{analyst_str}{tech_str}{unusual_str}{pcr_str}{sym_flags_str}\n"
     )
 
-    # News + sentiment (Yahoo headlines, supplemented by AV when available)
+    # News + sentiment
     news = ""
     if briefing.news:
         from .data.news import score_news_sentiment
         all_news = list(briefing.news)
 
-        # Merge AV news (deduped by title prefix) for broader coverage
         try:
             from .data.alphavantage import fetch_news_sentiment as _av_news
             av_items = _av_news(s.symbol, max_items=3)
@@ -142,7 +191,6 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
         sent_label = sentiment.get("label", "NEUTRAL")
         sent_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(sent_label, "")
 
-        # Format with age labels so Claude can weight freshness
         headlines = []
         for n in all_news[:5]:
             age = n.get("age", "")
@@ -150,7 +198,7 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
             headlines.append(f"{title} ({age})" if age else title)
         news = f"**News {sent_icon}{sent_label}:** " + " | ".join(headlines) + "\n\n"
 
-    # Insider (compact)
+    # Insider
     insider = ""
     if briefing.insider:
         recent = briefing.insider[:3]
@@ -158,9 +206,9 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
             f"{i['date']}: {i['transaction'][:40]}" for i in recent
         ) + "\n\n"
 
-    # Alpha Vantage fundamentals (only in full mode — when news is present)
+    # AV fundamentals
     av_fund_str = ""
-    if briefing.news:  # proxy for full mode
+    if briefing.news:
         try:
             from .data.alphavantage import fetch_fundamentals, format_fundamentals
             fund = fetch_fundamentals(s.symbol)
@@ -170,24 +218,29 @@ def _fmt_symbol_compact(briefing: SymbolBriefing, config: dict, regime: str) -> 
         except Exception:
             pass
 
-    calls = _fmt_option_table(briefing.call_chains, "Call Candidates", delta_lo, delta_hi)
-    puts = _fmt_option_table(briefing.put_chains, "Put Candidates", delta_lo, delta_hi, top_n=5)
+    # Scored call candidates (from scan_engine)
+    calls = _fmt_scored_table(result.candidates, "Call Candidates")
+
+    # Puts (secondary, unscored)
+    puts = _fmt_option_table(briefing.put_chains, "Put Candidates", delta_lo, delta_hi)
 
     return header + "\n" + av_fund_str + news + insider + calls + "\n" + puts
 
 
+# ---------------------------------------------------------------------------
+# Full briefing
+# ---------------------------------------------------------------------------
+
 def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
-    """Generate the full market briefing text. quick=True skips news/insider/analyst/puts."""
+    """Generate the full market briefing text via scan_engine."""
     if config is None:
         config = load_config()
 
-    symbols = get_symbols(config)
+    # Run the full scan pipeline (fetch + filter + score)
+    scan_result = scan_portfolio(config, quick=quick)
+    mkt = scan_result.market
 
-    _progress("Market context (VIX, SPY)...")
-    mkt = fetch_market_context(config)
     delta_lo, delta_hi = get_delta_range(config, mkt.regime)
-    regime_info = config.get("strategy", {}).get("regimes", {}).get(mkt.regime, {})
-
     short_calls = get_short_calls(config)
     short_calls_text = "None"
     if short_calls:
@@ -207,7 +260,7 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
 
     target = get_weekly_target(config)
 
-    # Rolling average from trade history
+    # Rolling average
     rolling_avg_str = ""
     try:
         from .db import get_weekly_summary
@@ -221,7 +274,7 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
     except Exception:
         pass
 
-    # Alpha Vantage macro data (if available)
+    # AV macro
     av_macro_str = ""
     if not quick:
         try:
@@ -240,31 +293,18 @@ def generate_briefing(config: dict | None = None, quick: bool = False) -> str:
     ---
     """)
 
-    # Fetch all symbols in parallel
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def _fetch_one(sym):
-        _progress(f"{sym}...")
-        return sym, fetch_symbol_briefing(sym, config, quick=quick)
-
-    briefings = {}
-    with ThreadPoolExecutor(max_workers=max(len(symbols), 1)) as pool:
-        futures = {pool.submit(_fetch_one, s): s for s in symbols}
-        for f in as_completed(futures):
-            sym, b = f.result()
-            briefings[sym] = b
-            _progress(f"{sym} done.")
-
-    sections = [_fmt_symbol_compact(briefings[s], config, mkt.regime) for s in symbols]
+    # Per-symbol sections from scan results
+    symbols = list(scan_result.symbols.keys())
+    sections = [_fmt_symbol_section(scan_result.symbols[s], config, mkt.regime) for s in symbols]
 
     # Roll analysis
     roll_section = ""
     if short_calls:
         _progress("Roll analysis...")
         from .roll import analyze_rolls
-        roll_section = "\n" + analyze_rolls(config) + "\n---\n\n"
+        roll_section = "\n" + analyze_rolls(config, regime=mkt.regime) + "\n---\n\n"
 
-    _progress("Done fetching. Generating analysis...")
+    _progress("Done. Generating analysis...")
     policy = _get_policy(config, mkt)
 
     return header + "\n".join(sections) + "\n---\n\n" + roll_section + policy
@@ -279,24 +319,30 @@ def _get_policy(config: dict, mkt: MarketContext) -> str:
     return dedent(f"""\
     ## INSTRUCTIONS FOR CLAUDE
 
-    You are Alpha Trader. Analyze the data above and output in **{LANGUAGES.get(get_language(config), 'English')}**, in EXACTLY this format.
-    Be concise. Tables first, explanations only if asked.
+    You are Alpha Trader. You are given:
+    1. **Hard-filtered** covered-call candidates (earnings blackout, ATR floor, cost basis constraints already enforced — these cannot be overridden)
+    2. A **composite score and sub-scores** (Income, Assignment Risk, Execution Quality, Event Risk) for each candidate
+    3. **Technical, event, news, and portfolio context** for your analysis
+
+    Use both the scoring model and your own analysis to produce the final recommendation.
+    Do not violate hard constraints — filtered candidates are excluded for a reason.
+    If you choose a lower-scored candidate or skip a high-scored one, explain why.
+    Output in **{LANGUAGES.get(get_language(config), 'English')}**.
 
     ### Rules
     - Covered calls on existing shares. RSU positions — minimize assignment risk.
-    - Income goal: ${target:,.0f}/wk **as a yearly rolling average** (~${target * 52:,.0f}/yr). Individual weeks can miss — do NOT force bad trades to hit the weekly number. Judge success by trailing 4-8 week average. If behind pace, lean slightly more aggressive (within regime bounds); if ahead, preserve gains. HARD CAP: never recommend more than ${int(target * catchup_cap_pct / 100):,}/wk ({catchup_cap_pct}% of target) in a single week — chasing losses destroys risk management.
+    - Income goal: ${target:,.0f}/wk **as a yearly rolling average** (~${target * 52:,.0f}/yr). Individual weeks can miss — do NOT force bad trades to hit the weekly number. Judge success by trailing 4-8 week average. If behind pace, lean slightly more aggressive (within regime bounds); if ahead, preserve gains. HARD CAP: never recommend more than ${int(target * catchup_cap_pct / 100):,}/wk ({catchup_cap_pct}% of target) in a single week.
     - Regime: {mkt.regime.upper()} → delta {delta_lo:.2f}–{delta_hi:.2f}
     - IV rank < 30 → lean lower delta. IV rank > 50 → lean higher delta.
-    - RSI > 70 (overbought): stock may pull back — use higher strike or skip.
-    - RSI < 30 (oversold): stock may bounce — sell further OTM.
-    - MACD ↑ (bullish momentum): use higher strikes to avoid assignment.
-    - BB SQUEEZE (narrow Bollinger): breakout likely — be conservative or wait.
-    - ATR guides OTM distance: strike should be ≥1 ATR above current price ideally.
-    - No calls within {strat.get('blackout_earnings_days', 7)} days of earnings.
-    - DTE range: {strat.get('dte_range', [3, 21])[0]}–{strat.get('dte_range', [3, 21])[1]}
-    - Prefer ">>>" rows (in target delta range), high OI, tight spread.
-    - Leave buffer — don't sell on all available contracts.
+    - RSI > 70 (overbought): consider higher strike or skip. RSI < 30 (oversold): sell further OTM.
+    - MACD ↑ (bullish momentum): higher strikes. BB SQUEEZE: be conservative or wait.
+    - Prefer >>> rows (in target delta range). Leave buffer — don't sell on all available contracts.
     - Use BID price (or last traded if market closed) for premium estimates.
+    ### How to read the Score table
+    - **Score** (0-100): composite rank. **Income**: premium yield + theta. **Risk**: delta + ATR + OTM safety.
+    - **Quality**: spread + OI liquidity. **Event**: macro/earnings window safety.
+    - **Flags**: >>> = delta in range, EVENT_RISK, EARNINGS_NEAR, LOW_OI, WIDE_SPREAD.
+    - Use the breakdown to understand *why* a candidate scored the way it did, then combine with your own analysis.
 
     ### Output format (STRICT)
 
@@ -307,10 +353,10 @@ def _get_policy(config: dict, mkt: MarketContext) -> str:
     [fill from data]
 
     ## Trades
-    | # | Action | Expiry | Strike | Contracts | Premium | Delta | OTM% |
-    |---|--------|--------|--------|-----------|---------|-------|------|
+    | # | Action | Expiry | Strike | Contracts | Premium | Delta | Score | OTM% |
+    |---|--------|--------|--------|-----------|---------|-------|-------|------|
     [each recommended trade as one row]
-    | | | | **Total** | | **$X,XXX** | | |
+    | | | | **Total** | | **$X,XXX** | | | |
 
     This week: $X,XXX | Rolling avg: $X,XXX/wk (X% of target) — ON TRACK or BEHIND PACE
 

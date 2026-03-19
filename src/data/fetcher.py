@@ -370,9 +370,6 @@ def fetch_option_chain(
     t = yf.Ticker(symbol)
     strat = config.get("strategy", {})
     dte_min, dte_max = strat.get("dte_range", [3, 21])
-    min_prem = strat.get("min_premium", 0.25)
-    min_oi = strat.get("min_open_interest", 50)
-    max_spread = strat.get("max_spread_pct", 20)
 
     try:
         expiries = t.options
@@ -408,23 +405,16 @@ def fetch_option_chain(
             is_off_hours = (bid == 0 and ask == 0 and last > 0)
             price_ref = last if is_off_hours else bid
             mid = last if is_off_hours else ((bid + ask) / 2 if (bid + ask) > 0 else 0)
-            # Off-hours: use volume as liquidity proxy since OI may be stale
-            liquidity = max(oi, vol) if is_off_hours else oi
 
-            # Filter: only OTM options
+            # Data-level filters only: OTM + has *some* price
             if option_type == "call" and strike <= stock_price:
                 continue
             if option_type == "put" and strike >= stock_price:
                 continue
-
-            if price_ref < min_prem:
-                continue
-            if liquidity < min_oi:
+            if price_ref <= 0:
                 continue
 
             spread_pct = ((ask - bid) / mid * 100) if (mid > 0 and not is_off_hours) else 0
-            if not is_off_hours and spread_pct > max_spread:
-                continue
 
             T = max(dte, 1) / 365.0
 
