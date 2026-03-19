@@ -66,9 +66,18 @@ scripts/cron_scan.sh   — cron automation (8AM + 12PM PST Mon-Fri)
 ./at spreads --symbol NVDA                # Multi-leg strategies
 ./at margin                               # Portfolio margin summary
 
-# ML
+# ML (timing signals)
 ./at ml train                             # Train model
 ./at ml predict                           # Current signals
+
+# Candidate Ranker (Stage 2)
+./at learner report                       # Readiness check + model status
+./at learner backfill                     # Label past-expiry candidates
+./at learner train                        # Train utility ranker
+./at learner eval                         # Dataset stats + model metrics
+./at learner shadow                       # Model vs heuristic comparison
+./at learner slices                       # Uplift by symbol/IV/regime/DTE
+./at learner promote                      # Check all gates before enabling
 
 # Self-learning
 ./at review                               # Strategy review: perf vs target + backtest

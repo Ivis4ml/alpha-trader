@@ -40,6 +40,7 @@ Analyze the Phase 2 data following the INSTRUCTIONS FOR CLAUDE section. Key rule
 - User wants backtest → `./at backtest --symbol SYMBOL`
 - User wants spreads → `./at spreads --symbol SYMBOL`
 - User wants ML → `./at ml predict`
+- User wants learner status → `./at learner report`
 - User wants report → `./at report weekly`
 - User wants correlation → `./at correlation`
 
