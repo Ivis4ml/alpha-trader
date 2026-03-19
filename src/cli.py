@@ -1021,8 +1021,85 @@ def cmd_learner(args):
             print(f"\n  No trained model.")
         print(f"{'=' * 55}\n")
 
+    elif action == "shadow":
+        from .candidate_ranker import run_shadow_comparison
+
+        print("\nRunning shadow comparison (model vs heuristic)...")
+        result = run_shadow_comparison()
+        if "error" in result:
+            print(f"  {result['error']}")
+            return
+
+        print(f"\n{'=' * 60}")
+        print(f"  SHADOW COMPARISON: Model vs Heuristic")
+        print(f"{'=' * 60}")
+        print(f"  Scans compared: {result['total_scans']}")
+        print(f"  Model wins:     {result['model_wins']}")
+        print(f"  Ties:           {result['ties']}")
+        print(f"  Heuristic wins: {result['heuristic_wins']}")
+        print(f"{'─' * 60}")
+        print(f"  Avg uplift:     {result['avg_uplift']:+.4f}")
+        print(f"  Median uplift:  {result['median_uplift']:+.4f}")
+        print(f"  Same pick:      {result['same_pick_pct']:.1f}%")
+        print(f"{'─' * 60}")
+
+        # Show recent comparisons
+        recent = result["comparisons"][-10:]
+        print(f"  Recent scans (last {len(recent)}):")
+        for c in recent:
+            arrow = ">>>" if c["uplift"] > 0 else "===" if c["uplift"] == 0 else "<<<"
+            print(f"    {c['scan_id'][:8]} {arrow} uplift={c['uplift']:+.3f}  "
+                  f"heur={c['heuristic_pick_utility']:.3f} model={c['model_pick_utility']:.3f}")
+        print(f"{'=' * 60}\n")
+
+    elif action == "slices":
+        from .candidate_ranker import run_slice_evaluation
+
+        print("\nRunning slice evaluation...")
+        slices = run_slice_evaluation()
+        if not slices:
+            print("  Not enough data or no model.")
+            return
+
+        for slice_name, results in slices.items():
+            if not results:
+                continue
+            print(f"\n{'─' * 60}")
+            print(f"  BY {slice_name.upper()}")
+            print(f"  {'Slice':<20s} {'N':>5s} {'Scans':>6s} {'Uplift':>8s} "
+                  f"{'Heur':>7s} {'Model':>7s} {'Win%':>6s}")
+            print(f"  {'─' * 56}")
+            for s in results:
+                print(f"  {s['slice']:<20s} {s['n_candidates']:>5d} {s['n_scans']:>6d} "
+                      f"{s['avg_uplift']:>+7.3f} "
+                      f"{s['heur_utility']:>7.3f} {s['model_utility']:>7.3f} "
+                      f"{s['model_win_pct']:>5.1f}%")
+        print()
+
+    elif action == "promote":
+        from .candidate_ranker import check_promotion_readiness
+
+        result = check_promotion_readiness()
+        print(f"\n{'=' * 55}")
+        print(f"  PROMOTION READINESS CHECK")
+        print(f"{'=' * 55}")
+        for name, passed, detail in result["checks"]:
+            icon = "[+]" if passed else "[-]"
+            extra = f" ({detail})" if detail and not passed else ""
+            print(f"  {icon} {name}{extra}")
+        print(f"{'─' * 55}")
+
+        if result["ready"]:
+            print(f"  All gates PASS.")
+            print(f"  Recommended: set learner_model_weight: 0.1 in config.yaml")
+            print(f"  Then monitor ./at learner shadow for stability before 0.2")
+        else:
+            failed = [c[0] for c in result["checks"] if not c[1]]
+            print(f"  NOT READY — failed: {', '.join(failed)}")
+        print(f"{'=' * 55}\n")
+
     else:
-        print("Usage: alpha-trader learner {train|eval|backfill|report}")
+        print("Usage: alpha-trader learner {train|eval|backfill|report|shadow|slices|promote}")
 
 
 def cmd_cron(args):
@@ -1343,6 +1420,9 @@ def main():
     learner_sub.add_parser("eval", help="Show dataset stats and model evaluation")
     learner_sub.add_parser("backfill", help="Backfill utility labels for past-expiry candidates")
     learner_sub.add_parser("report", help="Readiness report for candidate ranker")
+    learner_sub.add_parser("shadow", help="Compare model vs heuristic rankings on historical scans")
+    learner_sub.add_parser("slices", help="Break down uplift by symbol, IV, regime, DTE")
+    learner_sub.add_parser("promote", help="Check all promotion gates before enabling model weight")
     p_learner.set_defaults(func=cmd_learner)
 
     # report

@@ -400,3 +400,239 @@ def format_train_result(result: TrainResult) -> str:
 
     lines.append(f"{'=' * 65}\n")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Shadow comparison — model vs heuristic on historical data
+# ---------------------------------------------------------------------------
+
+def run_shadow_comparison() -> dict:
+    """Compare model vs heuristic rankings on all labeled scan groups.
+
+    For each scan group, computes which candidate each method would pick
+    as top-1, and what that candidate's actual utility was.
+    Returns summary dict.
+    """
+    dataset = load_dataset(min_label_confidence="medium")
+    if len(dataset.y) < 10:
+        return {"error": "Not enough labeled data for comparison"}
+
+    if not is_model_available():
+        return {"error": "No trained model"}
+
+    model_preds = predict_candidate_scores(dataset.X)
+
+    unique_scans = dataset.scan_ids.unique()
+    comparisons = []
+
+    for scan_id in unique_scans:
+        mask = dataset.scan_ids == scan_id
+        if mask.sum() < 2:
+            continue
+
+        y_scan = dataset.y[mask].values
+        heur_scan = dataset.heuristic_scores[mask].values
+        model_scan = model_preds[mask.values]
+        meta_scan = dataset.meta[mask]
+
+        best_utility = float(np.max(y_scan))
+        heur_top1_idx = np.argmax(heur_scan)
+        model_top1_idx = np.argmax(model_scan)
+
+        comparisons.append({
+            "scan_id": scan_id,
+            "n_candidates": int(mask.sum()),
+            "best_utility": round(best_utility, 4),
+            "heuristic_pick_utility": round(float(y_scan[heur_top1_idx]), 4),
+            "model_pick_utility": round(float(y_scan[model_top1_idx]), 4),
+            "uplift": round(float(y_scan[model_top1_idx] - y_scan[heur_top1_idx]), 4),
+            "heuristic_pick": f"{meta_scan.iloc[heur_top1_idx]['symbol']} ${meta_scan.iloc[heur_top1_idx]['strike']}",
+            "model_pick": f"{meta_scan.iloc[model_top1_idx]['symbol']} ${meta_scan.iloc[model_top1_idx]['strike']}",
+            "same_pick": heur_top1_idx == model_top1_idx,
+        })
+
+    if not comparisons:
+        return {"error": "No scan groups with 2+ candidates"}
+
+    uplifts = [c["uplift"] for c in comparisons]
+    model_wins = sum(1 for u in uplifts if u > 0)
+    ties = sum(1 for u in uplifts if u == 0)
+    heur_wins = sum(1 for u in uplifts if u < 0)
+
+    return {
+        "total_scans": len(comparisons),
+        "model_wins": model_wins,
+        "ties": ties,
+        "heuristic_wins": heur_wins,
+        "avg_uplift": round(float(np.mean(uplifts)), 4),
+        "median_uplift": round(float(np.median(uplifts)), 4),
+        "same_pick_pct": round(sum(1 for c in comparisons if c["same_pick"]) / len(comparisons) * 100, 1),
+        "comparisons": comparisons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slice evaluation — break down uplift by segment
+# ---------------------------------------------------------------------------
+
+def run_slice_evaluation() -> dict[str, list[dict]]:
+    """Break down model vs heuristic performance by key slices.
+
+    Slices: symbol, IV bucket, regime (from VIX), assigned/expired.
+    Returns dict of slice_name -> [{slice, n, uplift, heur_utility, model_utility}].
+    """
+    dataset = load_dataset(min_label_confidence="medium")
+    if len(dataset.y) < 10 or not is_model_available():
+        return {}
+
+    model_preds = predict_candidate_scores(dataset.X)
+
+    # Build per-row data
+    df = dataset.X.copy()
+    df["y"] = dataset.y.values
+    df["heuristic"] = dataset.heuristic_scores.values
+    df["model_pred"] = model_preds
+    df["scan_id"] = dataset.scan_ids.values
+    df["symbol"] = dataset.meta["symbol"].values
+    df["assigned"] = (dataset.y < 0).astype(int).values  # negative utility ≈ assigned
+
+    # Define slice functions
+    def _iv_bucket(iv):
+        if pd.isna(iv):
+            return "unknown"
+        if iv < 30:
+            return "low (<30)"
+        elif iv < 60:
+            return "mid (30-60)"
+        else:
+            return "high (60+)"
+
+    def _vix_regime(vix):
+        if pd.isna(vix):
+            return "unknown"
+        if vix < 15:
+            return "low (<15)"
+        elif vix < 25:
+            return "mid (15-25)"
+        else:
+            return "high (25+)"
+
+    def _dte_bucket(dte):
+        if pd.isna(dte):
+            return "unknown"
+        if dte <= 7:
+            return "weekly (<=7)"
+        elif dte <= 14:
+            return "biweekly (8-14)"
+        else:
+            return "monthly (15+)"
+
+    df["iv_bucket"] = df["iv_rank"].apply(_iv_bucket)
+    df["vix_regime"] = df["vix"].apply(_vix_regime)
+    df["dte_bucket"] = df["dte"].apply(_dte_bucket)
+
+    slices = {}
+
+    for slice_col in ["symbol", "iv_bucket", "vix_regime", "dte_bucket"]:
+        slice_results = []
+        for name, group in df.groupby(slice_col):
+            if len(group) < 5:
+                continue
+
+            # Per-scan uplift within this slice
+            uplifts = []
+            heur_utils = []
+            model_utils = []
+            for _, scan_group in group.groupby("scan_id"):
+                if len(scan_group) < 2:
+                    continue
+                y_s = scan_group["y"].values
+                h_s = scan_group["heuristic"].values
+                m_s = scan_group["model_pred"].values
+
+                h_pick = float(y_s[np.argmax(h_s)])
+                m_pick = float(y_s[np.argmax(m_s)])
+                uplifts.append(m_pick - h_pick)
+                heur_utils.append(h_pick)
+                model_utils.append(m_pick)
+
+            if not uplifts:
+                continue
+
+            slice_results.append({
+                "slice": str(name),
+                "n_candidates": len(group),
+                "n_scans": len(uplifts),
+                "avg_uplift": round(float(np.mean(uplifts)), 4),
+                "heur_utility": round(float(np.mean(heur_utils)), 4),
+                "model_utility": round(float(np.mean(model_utils)), 4),
+                "model_win_pct": round(sum(1 for u in uplifts if u > 0) / len(uplifts) * 100, 1),
+            })
+
+        slices[slice_col] = sorted(slice_results, key=lambda x: -x["avg_uplift"])
+
+    return slices
+
+
+# ---------------------------------------------------------------------------
+# Promotion helpers
+# ---------------------------------------------------------------------------
+
+def check_promotion_readiness() -> dict:
+    """Full promotion readiness check with all gates."""
+    result = {
+        "ready": False,
+        "checks": [],
+    }
+
+    # Gate 1: Model exists
+    if not is_model_available():
+        result["checks"].append(("Model trained", False, "No model"))
+        return result
+    result["checks"].append(("Model trained", True, ""))
+
+    # Gate 2: Enough data
+    from .db import get_labeled_candidate_count
+    stats = get_labeled_candidate_count()
+    labeled = stats.get("labeled", 0) or 0
+    scans = stats.get("scan_groups", 0) or 0
+    result["checks"].append((
+        f"Data volume ({labeled} candidates, {scans} scans)",
+        labeled >= MIN_CANDIDATES and scans >= MIN_SCAN_GROUPS,
+        f"need {MIN_CANDIDATES}/{MIN_SCAN_GROUPS}",
+    ))
+
+    # Gate 3: Positive uplift
+    meta = get_model_metadata()
+    metrics = meta.get("metrics", {}) if meta else {}
+    uplift = metrics.get("avg_top1_uplift", 0)
+    result["checks"].append((
+        f"Avg top-1 uplift ({uplift:+.4f})",
+        uplift > 0,
+        "must be > 0",
+    ))
+
+    # Gate 4: Slice stability — no major slice with negative uplift
+    slices = run_slice_evaluation()
+    symbol_slices = slices.get("symbol", [])
+    bad_symbols = [s for s in symbol_slices if s["avg_uplift"] < -0.1 and s["n_scans"] >= 5]
+    result["checks"].append((
+        f"No symbol with uplift < -0.1 ({len(bad_symbols)} bad)",
+        len(bad_symbols) == 0,
+        ", ".join(s["slice"] for s in bad_symbols) if bad_symbols else "",
+    ))
+
+    # Gate 5: Shadow consistency — model must not LOSE on more than 20% of scans.
+    # Ties (model and heuristic pick same utility) don't count against either.
+    shadow = run_shadow_comparison()
+    if "error" not in shadow:
+        total = max(shadow["total_scans"], 1)
+        loss_pct = shadow["heuristic_wins"] / total * 100
+        result["checks"].append((
+            f"Model loss rate {loss_pct:.0f}% (max 20%)",
+            loss_pct <= 20,
+            f"loses {shadow['heuristic_wins']}/{total}, wins {shadow['model_wins']}, ties {shadow['ties']}",
+        ))
+
+    result["ready"] = all(c[1] for c in result["checks"])
+    return result
