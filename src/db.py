@@ -763,16 +763,21 @@ def _compute_utility_label(
 ) -> float:
     """Compute the utility label for a candidate observation.
 
-    utility = premium_captured - λ * assignment_penalty
+    utility = clamp(premium_captured, -2, 1) - λ * assignment_penalty
 
-    This is the target variable for the Stage 2 ranker. Normalized
-    to per-share scale so it's comparable across different stock prices.
+    Clamped to [-2.5, 1.0] to prevent deep ITM assignments (where loss
+    can be 10-40x the premium) from dominating regression training.
+    The ranker needs to learn "assigned is bad" but doesn't need to
+    distinguish between -5x and -40x — both are equally "don't pick this".
     """
     if entry_premium <= 0:
         return 0.0
 
     # Premium capture ratio: 1.0 = kept everything, negative = net loss
     capture_ratio = terminal_pnl / entry_premium
+
+    # Clamp: deep losses all look the same to the ranker
+    capture_ratio = max(-2.0, min(1.0, capture_ratio))
 
     # Assignment penalty: only kicks in when assigned
     penalty = assignment_penalty_lambda if assigned else 0.0
